@@ -252,21 +252,26 @@ class PatentAgent:
         This claim will be embedded and used for vector search,
         improving retrieval quality by matching the document format.
         """
-        prompt = f"""당신은 특허 청구항 작성 전문가입니다.
+        system_prompt = """당신은 20년 경력의 베테랑 특허 변리사입니다. 
+사용자의 아이디어를 바탕으로, 이 기술이 특허로 출원되었을 때의 '제1항(독립항)'을 가상으로 작성하십시오.
 
-사용자의 아이디어를 바탕으로 **가상의 특허 청구항(Claim)**을 1~2문장으로 작성해주세요.
-실제 특허 청구항과 유사한 형식으로 작성하되, 핵심 기술 요소를 포함해야 합니다.
+작성 가이드라인:
+1. 전문 용어 사용: '데이터베이스' 대신 '벡터 색인 데이터 구조', '찾기' 대신 '유사도 기반 검색' 등 전문 용어를 사용하십시오.
+2. 구조화: [전제부] - [구성요소 1] - [구성요소 2] - [기능적 유기적 결합 관계] 순으로 작성하십시오.
+3. 형식: "~를 특징으로 하는 [기술 명칭]"과 같은 특허 특유의 문체(~하는 단계, ~를 포함하는 시스템 등)를 사용하십시오.
 
-[사용자 아이디어]
-{user_idea}
+이 가상 청구항은 실제 특허 데이터셋에서 유사한 기술을 찾아내기 위한 검색 쿼리로 사용됩니다."""
 
-[가상 특허 청구항]"""
+        user_prompt = f"아이디어: {user_idea}\n\n위 아이디어를 바탕으로 한 전문적인 가상 제1항(독립항)을 작성하십시오."
 
         response = await self.client.chat.completions.create(
             model=HYDE_MODEL,
-            messages=[{"role": "user", "content": prompt}],
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
             temperature=0.3,
-            max_tokens=300,
+            max_tokens=500,
         )
         
         hypothetical_claim = response.choices[0].message.content.strip()
@@ -334,27 +339,36 @@ class PatentAgent:
             for i, r in enumerate(results)
         ])
         
-        prompt = f"""당신은 특허 관련성 평가 전문가입니다.
+        system_prompt = """당신은 선행 기술 조사를 수행하는 특허 심사관입니다.
+검색된 특허가 사용자의 아이디어와 기술적으로 실질적인 관련이 있는지 평가하십시오.
 
-사용자의 아이디어와 검색된 특허들의 관련성을 0.0~1.0 점수로 평가해주세요.
+평가 기준 (0.0 ~ 1.0 점):
+1. 기술 분야 일치성: RAG, sLLM, 특허 분석 등 도메인이 일치하는가?
+2. 해결 수단 유사성: 아이디어의 핵심 메커니즘(예: Self-RAG, 하이브리드 인덱싱)이 해당 특허에 언급되었는가?
+3. 침해 분석 가치: 이 특허를 침해 리스크 분석 대상으로 삼을 가치가 있는가?
 
-[사용자 아이디어]
+반드시 JSON 형식으로 응답하십시오."""
+
+        user_prompt = f"""[사용자 아이디어]
 {user_idea}
 
 [검색된 특허 목록]
 {results_text}
 
-각 특허에 대해 다음 JSON 형식으로 응답해주세요:
+각 특허에 대해 다음 JSON 형식으로 평가하십시오:
 {{
   "results": [
-    {{"patent_id": "특허번호", "score": 0.0-1.0, "reason": "점수 이유"}}
+    {{"patent_id": "특허번호", "score": 0.0-1.0, "reason": "기술적 관련성 평가 이유"}}
   ],
-  "average_score": 평균점수
+  "average_score": 전체평균점수
 }}"""
 
         response = await self.client.chat.completions.create(
             model=GRADING_MODEL,
-            messages=[{"role": "user", "content": prompt}],
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
             response_format={"type": "json_object"},
             temperature=0.1,
         )
@@ -499,51 +513,62 @@ JSON 형식으로 응답:
             for r in results[:5]
         ])
         
-        prompt = f"""당신은 특허 분석 전문 변리사입니다. Chain-of-Thought 방식으로 심층 분석해주세요.
+        system_prompt = """당신은 특허 분쟁 대응 전문 변리사입니다. 
+제공된 선행 특허(Context)와 사용자의 아이디어를 대비 분석하여 전략 리포트를 작성하십시오.
 
-[분석 대상: 사용자 아이디어]
+분석 원칙:
+1. 구성요소 대비 분석: 사용자의 기술이 선행 특허 청구항의 모든 구성요소를 포함하는지 확인하십시오.
+2. 침해 리스크 판정: 
+   - [High]: 모든 구성요소가 동일하거나 균등물인 경우
+   - [Medium]: 핵심 로직은 유사하나 일부 구성요소가 생략된 경우
+   - [Low]: 기술적 아이디어만 유사할 뿐 구체적 수단이 다른 경우
+3. 회피 전략: 침해를 피하기 위해 삭제, 변경, 또는 추가해야 할 기술적 요소를 구체적으로 제시하십시오.
+
+출력 형식:
+[1. 유사도 평가] - 기술적 유사점 및 차별점
+[2. 침해 리스크] - 구체적인 위험도(High/Med/Low)와 그 논리적 근거
+[3. 회피 전략] - 법적/기술적 관점에서의 구체적인 설계 변경 제안
+
+반드시 각 분석 문장 끝에 근거가 된 특허 번호(예: [US-1234567-B2])를 명시하십시오."""
+
+        user_prompt = f"""[분석 대상: 사용자 아이디어]
 {user_idea}
 
-[참조 특허 목록]
+[참조 특허 목록 (선행 기술)]
 {patents_text}
 
-아래 JSON 형식으로 상세 분석을 제공해주세요. 
-**중요**: 모든 분석 내용에는 반드시 근거가 된 특허 번호를 evidence_patents에 명시하세요.
-
+위 선행 특허들과 사용자 아이디어를 대비 분석하여 아래 JSON 형식으로 응답하십시오:
 {{
   "similarity": {{
-    "score": 0-100 사이 점수,
-    "common_elements": ["공통 기술 요소 목록"],
-    "summary": "유사도에 대한 종합 평가",
+    "score": 0-100 사이 유사도 점수,
+    "common_elements": ["기술적 공통 구성요소 목록"],
+    "summary": "구성요소 대비 분석 결과",
     "evidence_patents": ["근거 특허 번호들"]
   }},
   "infringement": {{
     "risk_level": "high/medium/low",
-    "risk_factors": ["구체적 침해 위험 요소"],
-    "summary": "침해 리스크 종합 평가",
+    "risk_factors": ["구체적 침해 위험 구성요소"],
+    "summary": "All Elements Rule 기반 침해 리스크 평가",
     "evidence_patents": ["근거 특허 번호들"]
   }},
   "avoidance": {{
-    "strategies": ["회피 설계 방안들"],
-    "alternative_technologies": ["대안 기술 접근법"],
-    "summary": "권장 회피 전략",
+    "strategies": ["삭제/변경/추가해야 할 구체적 기술 요소"],
+    "alternative_technologies": ["대안적 구현 방식"],
+    "summary": "법적/기술적 회피 전략 권고",
     "evidence_patents": ["참고한 특허 번호들"]
   }},
-  "conclusion": "최종 권고 사항 (특허 출원 가능성, 주의점 등)"
+  "conclusion": "최종 권고 - 특허 출원 가능성 및 주의사항"
 }}"""
 
         response = await self.client.chat.completions.create(
             model=ANALYSIS_MODEL,
             messages=[
-                {
-                    "role": "system",
-                    "content": "당신은 특허 분석 전문가입니다. 항상 근거를 명시하며 분석합니다."
-                },
-                {"role": "user", "content": prompt}
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
             ],
             response_format={"type": "json_object"},
             temperature=0.2,
-            max_tokens=2000,
+            max_tokens=2500,
         )
         
         try:

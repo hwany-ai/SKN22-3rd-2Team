@@ -162,4 +162,4 @@ MIT License
 
 ## 👥 팀
 
-Patent Guard Team - SKN22-3rd-2Team
+ - 뀨💕
