@@ -58,6 +58,7 @@ EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "text-embedding-3-small")
 GRADING_MODEL = os.environ.get("GRADING_MODEL", "gpt-4o-mini")  # Cost-effective
 ANALYSIS_MODEL = os.environ.get("ANALYSIS_MODEL", "gpt-4o")  # High quality
 HYDE_MODEL = os.environ.get("HYDE_MODEL", "gpt-4o-mini")
+FALLBACK_MODEL = os.environ.get("FALLBACK_MODEL", "gpt-3.5-turbo")  # Fallback for errors
 
 # Thresholds - configurable via environment variables
 GRADING_THRESHOLD = float(os.environ.get("GRADING_THRESHOLD", "0.6"))
@@ -517,23 +518,43 @@ JSON 형식으로 응답:
         
         system_prompt, user_prompt = self._build_analysis_prompts(user_idea, patents_text)
         
-        response = await self.client.chat.completions.create(
-            model=ANALYSIS_MODEL,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ],
-            response_format={"type": "json_object"},
-            temperature=0.2,
-            max_tokens=2500,
-        )
-        
         try:
+            response = await self.client.chat.completions.create(
+                model=ANALYSIS_MODEL,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.2,
+                max_tokens=2500,
+            )
+            
             data = json_loads(response.choices[0].message.content)
             return CriticalAnalysisResponse(**data)
+            
         except Exception as e:
-            logger.error(f"Failed to parse analysis response: {e}")
-            return self._empty_analysis()
+            logger.error(f"Analysis failed with {ANALYSIS_MODEL}: {e}")
+            logger.warning(f"Falling back to {FALLBACK_MODEL}...")
+            
+            try:
+                # Fallback implementation
+                response = await self.client.chat.completions.create(
+                    model=FALLBACK_MODEL,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt}
+                    ],
+                    response_format={"type": "json_object"},
+                    temperature=0.2,
+                    max_tokens=2500,
+                )
+                
+                data = json_loads(response.choices[0].message.content)
+                return CriticalAnalysisResponse(**data)
+            except Exception as fallback_error:
+                logger.error(f"Fallback analysis failed: {fallback_error}")
+                return self._empty_analysis()
     
     # =========================================================================
     # 4. Critical CoT Analysis - Streaming
