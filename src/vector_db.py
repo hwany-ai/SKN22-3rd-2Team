@@ -1,13 +1,13 @@
 """
-Patent Guard v2.0 - Milvus Vector Database Operations
-======================================================
-Store and retrieve patent embeddings with metadata filtering.
+Patent Guard v3.0 - FAISS + BM25 Hybrid Vector Database
+========================================================
+In-memory vector database with Hybrid Search (RRF Fusion).
 
 Features:
-- Hybrid indexing with importance scores
-- IPC-based filtering
-- Citation metadata for PAI-NET integration
-- Async operations
+- FAISS IndexFlatIP for dense vector search
+- BM25 for sparse keyword search
+- RRF (Reciprocal Rank Fusion) for result merging
+- Zero-latency startup with pre-computed index
 
 Author: Patent Guard Team
 License: MIT
@@ -17,14 +17,29 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import List, Dict, Any, Optional, Union
+import pickle
+import re
+from collections import defaultdict
+from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass, field
-from datetime import datetime
+from pathlib import Path
 
 import numpy as np
 from tqdm import tqdm
 
-from config import config, MilvusConfig, EMBEDDINGS_DIR
+try:
+    import faiss
+    FAISS_AVAILABLE = True
+except ImportError:
+    FAISS_AVAILABLE = False
+
+try:
+    from rank_bm25 import BM25Okapi
+    BM25_AVAILABLE = True
+except ImportError:
+    BM25_AVAILABLE = False
+
+from config import config, FaissConfig, EMBEDDINGS_DIR, INDEX_DIR
 
 
 # =============================================================================
@@ -32,25 +47,6 @@ from config import config, MilvusConfig, EMBEDDINGS_DIR
 # =============================================================================
 
 logger = logging.getLogger(__name__)
-
-
-# =============================================================================
-# Lazy Import Milvus
-# =============================================================================
-
-try:
-    from pymilvus import (
-        connections,
-        Collection,
-        CollectionSchema,
-        FieldSchema,
-        DataType,
-        utility,
-    )
-    MILVUS_AVAILABLE = True
-except ImportError:
-    MILVUS_AVAILABLE = False
-    logger.warning("pymilvus not installed. Install with: pip install pymilvus")
 
 
 # =============================================================================
@@ -66,6 +62,11 @@ class SearchResult:
     content: str
     content_type: str
     metadata: Dict[str, Any] = field(default_factory=dict)
+    
+    # Hybrid search fields
+    dense_score: float = 0.0
+    sparse_score: float = 0.0
+    rrf_score: float = 0.0
 
 
 @dataclass
@@ -73,557 +74,630 @@ class InsertResult:
     """Result from inserting vectors."""
     success: bool
     inserted_count: int
-    collection_name: str
+    index_path: str
     error_message: Optional[str] = None
 
 
 # =============================================================================
-# Schema Definitions
+# BM25 Search Engine
 # =============================================================================
 
-def get_patent_chunks_schema(embedding_dim: int = 4096) -> CollectionSchema:
+class BM25SearchEngine:
     """
-    Create schema for patent chunks collection.
+    BM25-based sparse keyword search.
     
-    Fields:
-    - chunk_id: Primary key
-    - patent_id: Parent patent publication number
-    - content: Text content
-    - content_type: Type (title, abstract, claim, description)
-    - embedding: Dense vector
-    - ipc_code: Classification for filtering
-    - importance_score: Citation-based importance
-    - weight: Content type weight
+    Used in combination with FAISS for hybrid search.
     """
-    fields = [
-        FieldSchema(
-            name="chunk_id",
-            dtype=DataType.VARCHAR,
-            is_primary=True,
-            max_length=100,
-        ),
-        FieldSchema(
-            name="patent_id",
-            dtype=DataType.VARCHAR,
-            max_length=50,
-        ),
-        FieldSchema(
-            name="content",
-            dtype=DataType.VARCHAR,
-            max_length=65535,  # Max for Milvus VARCHAR
-        ),
-        FieldSchema(
-            name="content_type",
-            dtype=DataType.VARCHAR,
-            max_length=20,
-        ),
-        FieldSchema(
-            name="embedding",
-            dtype=DataType.FLOAT_VECTOR,
-            dim=embedding_dim,
-        ),
-        FieldSchema(
-            name="ipc_code",
-            dtype=DataType.VARCHAR,
-            max_length=20,
-        ),
-        FieldSchema(
-            name="importance_score",
-            dtype=DataType.FLOAT,
-        ),
-        FieldSchema(
-            name="weight",
-            dtype=DataType.FLOAT,
-        ),
-        FieldSchema(
-            name="claim_number",
-            dtype=DataType.INT64,
-        ),
-        FieldSchema(
-            name="rag_components",
-            dtype=DataType.VARCHAR,
-            max_length=500,  # JSON array as string
-        ),
-    ]
     
-    return CollectionSchema(
-        fields=fields,
-        description="Patent Guard v2.0 - Patent Chunks with Embeddings",
-    )
-
-
-def get_triplets_schema(embedding_dim: int = 4096) -> CollectionSchema:
-    """
-    Create schema for PAI-NET triplets collection.
-    """
-    fields = [
-        FieldSchema(
-            name="triplet_id",
-            dtype=DataType.VARCHAR,
-            is_primary=True,
-            max_length=100,
-        ),
-        FieldSchema(
-            name="anchor_id",
-            dtype=DataType.VARCHAR,
-            max_length=50,
-        ),
-        FieldSchema(
-            name="positive_id",
-            dtype=DataType.VARCHAR,
-            max_length=50,
-        ),
-        FieldSchema(
-            name="negative_id",
-            dtype=DataType.VARCHAR,
-            max_length=50,
-        ),
-        FieldSchema(
-            name="anchor_embedding",
-            dtype=DataType.FLOAT_VECTOR,
-            dim=embedding_dim,
-        ),
-        FieldSchema(
-            name="positive_embedding",
-            dtype=DataType.FLOAT_VECTOR,
-            dim=embedding_dim,
-        ),
-        FieldSchema(
-            name="negative_embedding",
-            dtype=DataType.FLOAT_VECTOR,
-            dim=embedding_dim,
-        ),
-        FieldSchema(
-            name="sampling_method",
-            dtype=DataType.VARCHAR,
-            max_length=10,  # "hard" or "random"
-        ),
-    ]
+    def __init__(self):
+        self.bm25 = None
+        self.corpus = []
+        self.chunk_ids = []
+        self.metadata_list = []
+        self._initialized = False
     
-    return CollectionSchema(
-        fields=fields,
-        description="Patent Guard v2.0 - PAI-NET Triplets",
-    )
+    def build_index(
+        self,
+        documents: List[Dict[str, Any]],
+        text_key: str = "content",
+        id_key: str = "chunk_id",
+    ) -> None:
+        """
+        Build BM25 index from documents.
+        
+        Args:
+            documents: List of document dicts
+            text_key: Key for text content
+            id_key: Key for document ID
+        """
+        if not BM25_AVAILABLE:
+            logger.warning("rank_bm25 not available. Install with: pip install rank_bm25")
+            return
+        
+        self.corpus = []
+        self.chunk_ids = []
+        self.metadata_list = []
+        
+        for doc in documents:
+            text = doc.get(text_key, "")
+            # Tokenize: lowercase and split
+            tokens = self._tokenize(text)
+            self.corpus.append(tokens)
+            self.chunk_ids.append(doc.get(id_key, ""))
+            self.metadata_list.append(doc)
+        
+        self.bm25 = BM25Okapi(self.corpus)
+        self._initialized = True
+        
+        logger.info(f"Built BM25 index for {len(self.corpus)} documents")
+    
+    def search(
+        self,
+        query: str,
+        top_k: int = 10,
+    ) -> List[Tuple[str, float, Dict[str, Any]]]:
+        """
+        Search using BM25.
+        
+        Returns:
+            List of (chunk_id, score, metadata) tuples
+        """
+        if not self._initialized or self.bm25 is None:
+            logger.warning("BM25 index not initialized")
+            return []
+        
+        query_tokens = self._tokenize(query)
+        scores = self.bm25.get_scores(query_tokens)
+        
+        # Get top-k indices
+        top_indices = np.argsort(scores)[::-1][:top_k]
+        
+        results = []
+        for idx in top_indices:
+            if scores[idx] > 0:
+                results.append((
+                    self.chunk_ids[idx],
+                    float(scores[idx]),
+                    self.metadata_list[idx],
+                ))
+        
+        return results
+    
+    def _tokenize(self, text: str) -> List[str]:
+        """Simple tokenization: lowercase, split, filter."""
+        if not text:
+            return []
+        
+        # Lowercase and split
+        tokens = text.lower().split()
+        
+        # Remove very short tokens and punctuation-only tokens
+        tokens = [t for t in tokens if len(t) > 2 and re.search(r'[a-z0-9]', t)]
+        
+        return tokens
+    
+    def save_local(self, path: Path) -> None:
+        """Save BM25 index to disk."""
+        data = {
+            "corpus": self.corpus,
+            "chunk_ids": self.chunk_ids,
+            "metadata_list": self.metadata_list,
+        }
+        with open(path, 'wb') as f:
+            pickle.dump(data, f)
+        logger.info(f"Saved BM25 index to {path}")
+    
+    def load_local(self, path: Path) -> bool:
+        """Load BM25 index from disk."""
+        if not path.exists():
+            return False
+        
+        try:
+            with open(path, 'rb') as f:
+                data = pickle.load(f)
+            
+            self.corpus = data["corpus"]
+            self.chunk_ids = data["chunk_ids"]
+            self.metadata_list = data["metadata_list"]
+            
+            if BM25_AVAILABLE:
+                self.bm25 = BM25Okapi(self.corpus)
+                self._initialized = True
+                logger.info(f"Loaded BM25 index from {path} ({len(self.corpus)} docs)")
+                return True
+            else:
+                logger.warning("rank_bm25 not available")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Failed to load BM25 index: {e}")
+            return False
 
 
 # =============================================================================
-# Milvus Client
+# FAISS Client with Hybrid Search
 # =============================================================================
 
-class MilvusClient:
+class FaissClient:
     """
-    Client for Milvus vector database operations.
+    FAISS-based in-memory vector database with Hybrid Search.
     
-    Handles:
-    - Collection creation with proper schemas
-    - Index creation optimized for 4096-dim vectors
-    - Insert and search operations
-    - Metadata filtering (IPC, importance score)
+    Features:
+    - Dense search using FAISS IndexFlatIP
+    - Sparse search using BM25
+    - RRF (Reciprocal Rank Fusion) for combining results
     """
     
     def __init__(
         self,
-        milvus_config: MilvusConfig = config.milvus,
-        embedding_dim: int = config.embedding.embedding_dim,
+        faiss_config: FaissConfig = None,
+        embedding_dim: int = None,
     ):
-        self.config = milvus_config
-        self.embedding_dim = embedding_dim
-        self._connected = False
+        if not FAISS_AVAILABLE:
+            raise ImportError("faiss-cpu is required. Install with: pip install faiss-cpu")
         
-        if not MILVUS_AVAILABLE:
-            raise ImportError("pymilvus is required. Install with: pip install pymilvus")
+        self.config = faiss_config or config.faiss
+        self.embedding_dim = embedding_dim or config.embedding.embedding_dim
+        
+        # FAISS index
+        self.index = None
+        self.metadata: Dict[int, Dict[str, Any]] = {}
+        self.id_to_idx: Dict[str, int] = {}
+        self._loaded = False
+        
+        # BM25 engine for hybrid search
+        self.bm25_engine = BM25SearchEngine()
+        self.bm25_path = self.config.index_path.parent / "bm25_index.pkl"
+        
+        logger.info(f"FAISS Client initialized (dim={self.embedding_dim})")
     
-    async def connect(self) -> None:
-        """Connect to Milvus server."""
-        if self._connected:
-            return
-        
-        loop = asyncio.get_event_loop()
-        
-        await loop.run_in_executor(
-            None,
-            lambda: connections.connect(
-                alias="default",
-                host=self.config.host,
-                port=self.config.port,
-            )
-        )
-        
-        self._connected = True
-        logger.info(f"Connected to Milvus at {self.config.host}:{self.config.port}")
-    
-    async def disconnect(self) -> None:
-        """Disconnect from Milvus server."""
-        if not self._connected:
-            return
-        
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, lambda: connections.disconnect("default"))
-        
-        self._connected = False
-        logger.info("Disconnected from Milvus")
-    
-    async def create_patents_collection(
-        self,
-        collection_name: Optional[str] = None,
-        drop_existing: bool = False,
-    ) -> Collection:
+    def create_index(self, use_cosine: bool = True) -> None:
         """
-        Create collection for patent chunks.
-        
-        Args:
-            collection_name: Name of collection
-            drop_existing: Whether to drop existing collection
-            
-        Returns:
-            Milvus Collection object
+        Create a new FAISS index.
         """
-        await self.connect()
+        if use_cosine:
+            self.index = faiss.IndexFlatIP(self.embedding_dim)
+            logger.info(f"Created IndexFlatIP (cosine similarity) with dim={self.embedding_dim}")
+        else:
+            self.index = faiss.IndexFlatL2(self.embedding_dim)
+            logger.info(f"Created IndexFlatL2 with dim={self.embedding_dim}")
         
-        name = collection_name or self.config.patents_collection
-        loop = asyncio.get_event_loop()
-        
-        # Check if exists
-        exists = await loop.run_in_executor(
-            None, lambda: utility.has_collection(name)
-        )
-        
-        if exists:
-            if drop_existing:
-                logger.warning(f"Dropping existing collection: {name}")
-                await loop.run_in_executor(
-                    None, lambda: utility.drop_collection(name)
-                )
-            else:
-                logger.info(f"Using existing collection: {name}")
-                return Collection(name)
-        
-        # Create collection
-        schema = get_patent_chunks_schema(self.embedding_dim)
-        
-        collection = await loop.run_in_executor(
-            None,
-            lambda: Collection(name=name, schema=schema)
-        )
-        
-        logger.info(f"Created collection: {name}")
-        
-        # Create index
-        await self._create_index(collection, "embedding")
-        
-        return collection
+        self.metadata = {}
+        self.id_to_idx = {}
+        self._loaded = True
     
-    async def create_triplets_collection(
+    def add_vectors(
         self,
-        collection_name: Optional[str] = None,
-        drop_existing: bool = False,
-    ) -> Collection:
-        """Create collection for PAI-NET triplets."""
-        await self.connect()
-        
-        name = collection_name or self.config.triplets_collection
-        loop = asyncio.get_event_loop()
-        
-        exists = await loop.run_in_executor(
-            None, lambda: utility.has_collection(name)
-        )
-        
-        if exists:
-            if drop_existing:
-                await loop.run_in_executor(
-                    None, lambda: utility.drop_collection(name)
-                )
-            else:
-                return Collection(name)
-        
-        schema = get_triplets_schema(self.embedding_dim)
-        
-        collection = await loop.run_in_executor(
-            None,
-            lambda: Collection(name=name, schema=schema)
-        )
-        
-        # Create indices for all embedding fields
-        for field_name in ["anchor_embedding", "positive_embedding", "negative_embedding"]:
-            await self._create_index(collection, field_name)
-        
-        logger.info(f"Created triplets collection: {name}")
-        
-        return collection
-    
-    async def _create_index(
-        self,
-        collection: Collection,
-        field_name: str,
-    ) -> None:
-        """Create index on embedding field."""
-        loop = asyncio.get_event_loop()
-        
-        index_params = {
-            "index_type": self.config.index_type,
-            "metric_type": self.config.metric_type,
-            "params": {"nlist": self.config.nlist},
-        }
-        
-        await loop.run_in_executor(
-            None,
-            lambda: collection.create_index(field_name, index_params)
-        )
-        
-        logger.info(f"Created {self.config.index_type} index on {field_name}")
-    
-    async def insert_patent_chunks(
-        self,
-        chunks: List[Dict[str, Any]],
-        embeddings: List[np.ndarray],
-        collection_name: Optional[str] = None,
-        batch_size: int = 100,
-    ) -> InsertResult:
+        embeddings: np.ndarray,
+        metadata_list: List[Dict[str, Any]],
+        normalize: bool = True,
+    ) -> int:
         """
-        Insert patent chunks with embeddings.
-        
-        Args:
-            chunks: List of chunk dictionaries
-            embeddings: Corresponding embeddings
-            collection_name: Target collection
-            batch_size: Batch size for insertion
-            
-        Returns:
-            InsertResult with status
+        Add vectors to the index with metadata.
+        Also builds BM25 index for hybrid search.
         """
-        await self.connect()
+        if self.index is None:
+            self.create_index()
         
-        name = collection_name or self.config.patents_collection
-        collection = Collection(name)
+        embeddings = embeddings.astype(np.float32)
         
-        loop = asyncio.get_event_loop()
-        total_inserted = 0
+        if normalize:
+            faiss.normalize_L2(embeddings)
         
-        try:
-            for i in tqdm(range(0, len(chunks), batch_size), desc="Inserting"):
-                batch_chunks = chunks[i:i + batch_size]
-                batch_embeddings = embeddings[i:i + batch_size]
-                
-                # Prepare data for insertion
-                data = [
-                    [c.get("chunk_id", f"chunk_{i+j}") for j, c in enumerate(batch_chunks)],
-                    [c.get("patent_id", "") for c in batch_chunks],
-                    [c.get("content", "")[:65535] for c in batch_chunks],  # Truncate if needed
-                    [c.get("content_type", "description") for c in batch_chunks],
-                    [e.tolist() for e in batch_embeddings],
-                    [c.get("ipc_code", "")[:20] for c in batch_chunks],
-                    [float(c.get("importance_score", 0.0)) for c in batch_chunks],
-                    [float(c.get("weight", 1.0)) for c in batch_chunks],
-                    [int(c.get("claim_number", 0)) for c in batch_chunks],
-                    [str(c.get("rag_components", "[]"))[:500] for c in batch_chunks],
-                ]
-                
-                await loop.run_in_executor(
-                    None,
-                    lambda d=data: collection.insert(d)
-                )
-                
-                total_inserted += len(batch_chunks)
-            
-            # Flush to ensure data is persisted
-            await loop.run_in_executor(None, collection.flush)
-            
-            return InsertResult(
-                success=True,
-                inserted_count=total_inserted,
-                collection_name=name,
-            )
-            
-        except Exception as e:
-            logger.error(f"Insert failed: {e}")
-            return InsertResult(
-                success=False,
-                inserted_count=total_inserted,
-                collection_name=name,
-                error_message=str(e),
-            )
+        start_idx = self.index.ntotal
+        self.index.add(embeddings)
+        
+        for i, meta in enumerate(metadata_list):
+            idx = start_idx + i
+            self.metadata[idx] = meta
+            chunk_id = meta.get("chunk_id", f"chunk_{idx}")
+            self.id_to_idx[chunk_id] = idx
+        
+        # Build BM25 index for hybrid search
+        self.bm25_engine.build_index(metadata_list, text_key="content", id_key="chunk_id")
+        
+        logger.info(f"Added {len(embeddings)} vectors to index (total: {self.index.ntotal})")
+        
+        return len(embeddings)
     
-    async def search(
+    def search(
         self,
         query_embedding: np.ndarray,
-        collection_name: Optional[str] = None,
         top_k: int = 10,
-        ipc_filter: Optional[str] = None,
-        min_importance: Optional[float] = None,
-        content_type_filter: Optional[str] = None,
+        normalize: bool = True,
     ) -> List[SearchResult]:
         """
-        Search for similar patent chunks.
+        Search for similar vectors (dense search only).
+        """
+        if self.index is None or self.index.ntotal == 0:
+            return []
+        
+        if query_embedding.ndim == 1:
+            query_embedding = query_embedding.reshape(1, -1)
+        
+        query_embedding = query_embedding.astype(np.float32)
+        
+        if normalize:
+            faiss.normalize_L2(query_embedding)
+        
+        scores, indices = self.index.search(query_embedding, min(top_k, self.index.ntotal))
+        
+        results = []
+        for score, idx in zip(scores[0], indices[0]):
+            if idx < 0:
+                continue
+            
+            meta = self.metadata.get(int(idx), {})
+            
+            results.append(SearchResult(
+                chunk_id=meta.get("chunk_id", f"chunk_{idx}"),
+                patent_id=meta.get("patent_id", ""),
+                score=float(score),
+                content=meta.get("content", ""),
+                content_type=meta.get("content_type", ""),
+                dense_score=float(score),
+                metadata={
+                    "ipc_code": meta.get("ipc_code", ""),
+                    "importance_score": meta.get("importance_score", 0.0),
+                    "weight": meta.get("weight", 1.0),
+                    "title": meta.get("title", ""),
+                    "abstract": meta.get("abstract", ""),
+                    "claims": meta.get("claims", ""),
+                },
+            ))
+        
+        return results
+    
+    def hybrid_search(
+        self,
+        query_embedding: np.ndarray,
+        query_text: str,
+        top_k: int = 10,
+        dense_weight: float = 0.5,
+        sparse_weight: float = 0.5,
+        rrf_k: int = 60,
+        normalize: bool = True,
+    ) -> List[SearchResult]:
+        """
+        Hybrid search combining dense (FAISS) and sparse (BM25) results using RRF.
         
         Args:
-            query_embedding: Query vector
-            collection_name: Collection to search
-            top_k: Number of results
-            ipc_filter: Filter by IPC code prefix
-            min_importance: Minimum importance score
-            content_type_filter: Filter by content type
+            query_embedding: Dense query vector
+            query_text: Original query text for BM25
+            top_k: Number of results to return
+            dense_weight: Weight for dense search in RRF
+            sparse_weight: Weight for sparse search in RRF
+            rrf_k: RRF constant (default 60)
+            normalize: Normalize query embedding
             
         Returns:
-            List of SearchResult objects
+            List of SearchResult objects sorted by RRF score
         """
-        await self.connect()
+        # Dense search
+        dense_results = self.search(query_embedding, top_k=top_k * 2, normalize=normalize)
         
-        name = collection_name or self.config.patents_collection
-        collection = Collection(name)
+        # Sparse search
+        sparse_raw = self.bm25_engine.search(query_text, top_k=top_k * 2)
         
+        # RRF Fusion
+        rrf_scores: Dict[str, float] = defaultdict(float)
+        chunk_data: Dict[str, SearchResult] = {}
+        
+        # Process dense results
+        for rank, result in enumerate(dense_results):
+            rrf_scores[result.chunk_id] += dense_weight / (rrf_k + rank + 1)
+            result.dense_score = result.score
+            chunk_data[result.chunk_id] = result
+        
+        # Process sparse results
+        for rank, (chunk_id, score, meta) in enumerate(sparse_raw):
+            rrf_scores[chunk_id] += sparse_weight / (rrf_k + rank + 1)
+            
+            if chunk_id not in chunk_data:
+                # Create SearchResult from BM25 result
+                chunk_data[chunk_id] = SearchResult(
+                    chunk_id=chunk_id,
+                    patent_id=meta.get("patent_id", ""),
+                    score=0.0,
+                    content=meta.get("content", ""),
+                    content_type=meta.get("content_type", ""),
+                    sparse_score=score,
+                    metadata={
+                        "ipc_code": meta.get("ipc_code", ""),
+                        "importance_score": meta.get("importance_score", 0.0),
+                        "title": meta.get("title", ""),
+                        "abstract": meta.get("abstract", ""),
+                        "claims": meta.get("claims", ""),
+                    },
+                )
+            else:
+                chunk_data[chunk_id].sparse_score = score
+        
+        # Sort by RRF score and update results
+        sorted_ids = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
+        
+        final_results = []
+        for chunk_id, rrf_score in sorted_ids[:top_k]:
+            if chunk_id in chunk_data:
+                result = chunk_data[chunk_id]
+                result.rrf_score = rrf_score
+                result.score = rrf_score  # Use RRF score as primary score
+                final_results.append(result)
+        
+        logger.info(f"Hybrid search: {len(dense_results)} dense + {len(sparse_raw)} sparse -> {len(final_results)} fused")
+        
+        return final_results
+    
+    async def async_search(
+        self,
+        query_embedding: np.ndarray,
+        top_k: int = 10,
+        normalize: bool = True,
+    ) -> List[SearchResult]:
+        """Async wrapper for dense search."""
         loop = asyncio.get_event_loop()
-        
-        # Load collection
-        await loop.run_in_executor(None, collection.load)
-        
-        # Build filter expression
-        expr_parts = []
-        if ipc_filter:
-            expr_parts.append(f'ipc_code like "{ipc_filter}%"')
-        if min_importance is not None:
-            expr_parts.append(f'importance_score >= {min_importance}')
-        if content_type_filter:
-            expr_parts.append(f'content_type == "{content_type_filter}"')
-        
-        expr = " and ".join(expr_parts) if expr_parts else None
-        
-        # Search
-        search_params = self.config.search_params
-        
-        results = await loop.run_in_executor(
+        return await loop.run_in_executor(
             None,
-            lambda: collection.search(
-                data=[query_embedding.tolist()],
-                anns_field="embedding",
-                param=search_params,
-                limit=top_k,
-                expr=expr,
-                output_fields=[
-                    "chunk_id", "patent_id", "content", "content_type",
-                    "ipc_code", "importance_score", "weight", "rag_components"
-                ],
+            lambda: self.search(query_embedding, top_k, normalize)
+        )
+    
+    async def async_hybrid_search(
+        self,
+        query_embedding: np.ndarray,
+        query_text: str,
+        top_k: int = 10,
+        dense_weight: float = 0.5,
+        sparse_weight: float = 0.5,
+    ) -> List[SearchResult]:
+        """Async wrapper for hybrid search."""
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            None,
+            lambda: self.hybrid_search(
+                query_embedding, query_text, top_k, dense_weight, sparse_weight
             )
         )
-        
-        # Convert to SearchResult
-        search_results = []
-        for hits in results:
-            for hit in hits:
-                search_results.append(SearchResult(
-                    chunk_id=hit.entity.get("chunk_id"),
-                    patent_id=hit.entity.get("patent_id"),
-                    score=hit.score,
-                    content=hit.entity.get("content"),
-                    content_type=hit.entity.get("content_type"),
-                    metadata={
-                        "ipc_code": hit.entity.get("ipc_code"),
-                        "importance_score": hit.entity.get("importance_score"),
-                        "weight": hit.entity.get("weight"),
-                        "rag_components": hit.entity.get("rag_components"),
-                    },
-                ))
-        
-        return search_results
     
-    async def get_collection_stats(
-        self,
-        collection_name: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        """Get collection statistics."""
-        await self.connect()
+    def save_local(self, index_path: Path = None, metadata_path: Path = None) -> None:
+        """Save FAISS index, metadata, and BM25 index to disk."""
+        index_path = index_path or self.config.index_path
+        metadata_path = metadata_path or self.config.metadata_path
         
-        name = collection_name or self.config.patents_collection
-        loop = asyncio.get_event_loop()
+        index_path.parent.mkdir(parents=True, exist_ok=True)
         
-        if not await loop.run_in_executor(None, lambda: utility.has_collection(name)):
-            return {"exists": False}
+        # Save FAISS index
+        faiss.write_index(self.index, str(index_path))
+        logger.info(f"Saved FAISS index to {index_path} ({self.index.ntotal} vectors)")
         
-        collection = Collection(name)
+        # Save metadata
+        with open(metadata_path, 'wb') as f:
+            pickle.dump({
+                "metadata": self.metadata,
+                "id_to_idx": self.id_to_idx,
+            }, f)
+        logger.info(f"Saved metadata to {metadata_path}")
         
-        stats = await loop.run_in_executor(None, lambda: collection.num_entities)
+        # Save BM25 index
+        self.bm25_engine.save_local(self.bm25_path)
+    
+    def load_local(self, index_path: Path = None, metadata_path: Path = None) -> bool:
+        """Load FAISS index, metadata, and BM25 index from disk."""
+        index_path = index_path or self.config.index_path
+        metadata_path = metadata_path or self.config.metadata_path
+        
+        if not index_path.exists():
+            logger.warning(f"Index file not found: {index_path}")
+            return False
+        
+        if not metadata_path.exists():
+            logger.warning(f"Metadata file not found: {metadata_path}")
+            return False
+        
+        try:
+            # Load FAISS index
+            self.index = faiss.read_index(str(index_path))
+            logger.info(f"Loaded FAISS index from {index_path} ({self.index.ntotal} vectors)")
+            
+            # Load metadata
+            with open(metadata_path, 'rb') as f:
+                data = pickle.load(f)
+                self.metadata = data.get("metadata", {})
+                self.id_to_idx = data.get("id_to_idx", {})
+            logger.info(f"Loaded metadata from {metadata_path}")
+            
+            # Load BM25 index
+            if self.bm25_path.exists():
+                self.bm25_engine.load_local(self.bm25_path)
+            else:
+                # Rebuild BM25 from metadata
+                docs = list(self.metadata.values())
+                if docs:
+                    self.bm25_engine.build_index(docs, text_key="content", id_key="chunk_id")
+            
+            self._loaded = True
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to load index: {e}")
+            return False
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Get index statistics."""
+        if self.index is None:
+            return {"initialized": False, "total_vectors": 0}
         
         return {
-            "exists": True,
-            "name": name,
-            "num_entities": stats,
+            "initialized": True,
+            "total_vectors": self.index.ntotal,
+            "embedding_dim": self.embedding_dim,
+            "index_type": type(self.index).__name__,
+            "metadata_count": len(self.metadata),
+            "bm25_initialized": self.bm25_engine._initialized,
+            "bm25_docs": len(self.bm25_engine.corpus) if self.bm25_engine._initialized else 0,
         }
+
+
+# =============================================================================
+# Keyword Extractor
+# =============================================================================
+
+class KeywordExtractor:
+    """
+    Extract keywords from query text for BM25 search.
+    """
+    
+    # Common stop words to filter out
+    STOP_WORDS = {
+        'a', 'an', 'the', 'is', 'are', 'was', 'were', 'be', 'been', 'being',
+        'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could',
+        'should', 'may', 'might', 'must', 'shall', 'can', 'need', 'dare',
+        'to', 'of', 'in', 'for', 'on', 'with', 'at', 'by', 'from', 'as',
+        'into', 'through', 'during', 'before', 'after', 'above', 'below',
+        'between', 'under', 'again', 'further', 'then', 'once', 'here',
+        'there', 'when', 'where', 'why', 'how', 'all', 'each', 'few',
+        'more', 'most', 'other', 'some', 'such', 'no', 'nor', 'not', 'only',
+        'own', 'same', 'so', 'than', 'too', 'very', 'just', 'and', 'but',
+        'if', 'or', 'because', 'until', 'while', 'this', 'that', 'these',
+        'those', 'what', 'which', 'who', 'whom', 'whose',
+    }
+    
+    # Technical terms to boost
+    TECHNICAL_TERMS = {
+        'method', 'system', 'apparatus', 'device', 'process', 'machine',
+        'algorithm', 'model', 'network', 'layer', 'module', 'component',
+        'database', 'index', 'vector', 'embedding', 'retrieval', 'search',
+        'query', 'document', 'text', 'language', 'neural', 'learning',
+        'training', 'inference', 'classification', 'clustering', 'ranking',
+        'generation', 'processing', 'analysis', 'extraction', 'recognition',
+    }
+    
+    @classmethod
+    def extract(cls, text: str, max_keywords: int = 20) -> List[str]:
+        """
+        Extract keywords from text.
+        
+        Args:
+            text: Input text
+            max_keywords: Maximum number of keywords to return
+            
+        Returns:
+            List of keywords sorted by importance
+        """
+        if not text:
+            return []
+        
+        # Tokenize
+        words = re.findall(r'\b[a-zA-Z][a-zA-Z0-9]*\b', text.lower())
+        
+        # Filter stop words and short words
+        filtered = [w for w in words if w not in cls.STOP_WORDS and len(w) > 2]
+        
+        # Count frequency
+        word_freq = defaultdict(int)
+        for word in filtered:
+            word_freq[word] += 1
+        
+        # Score words (frequency + technical term boost)
+        scored = []
+        for word, freq in word_freq.items():
+            score = freq
+            if word in cls.TECHNICAL_TERMS:
+                score *= 2  # Boost technical terms
+            scored.append((word, score))
+        
+        # Sort by score
+        scored.sort(key=lambda x: x[1], reverse=True)
+        
+        return [word for word, _ in scored[:max_keywords]]
 
 
 # =============================================================================
 # High-Level Operations
 # =============================================================================
 
-async def index_processed_patents(
+async def build_index_from_patents(
     processed_patents: List[Dict[str, Any]],
-    embedder,  # PatentEmbedder instance
-    milvus_client: MilvusClient,
-    collection_name: Optional[str] = None,
+    embedder,
+    faiss_client: FaissClient = None,
+    save_to_disk: bool = True,
 ) -> InsertResult:
-    """
-    Index processed patents with embeddings.
+    """Build FAISS + BM25 hybrid index from processed patents."""
+    if faiss_client is None:
+        faiss_client = FaissClient()
     
-    Args:
-        processed_patents: List of processed patent dictionaries
-        embedder: PatentEmbedder instance
-        milvus_client: MilvusClient instance
-        collection_name: Target collection
-        
-    Returns:
-        InsertResult with status
-    """
-    import json
+    logger.info(f"Building hybrid index from {len(processed_patents)} patents...")
     
-    logger.info(f"Indexing {len(processed_patents)} patents...")
-    
-    # Extract all chunks
     all_chunks = []
-    
     for patent in tqdm(processed_patents, desc="Extracting chunks"):
+        patent_metadata = {
+            "patent_id": patent.get("publication_number", ""),
+            "title": patent.get("title", ""),
+            "abstract": patent.get("abstract", ""),
+            "ipc_codes": patent.get("ipc_codes", []),
+            "importance_score": patent.get("importance_score", 0.0),
+        }
+        
+        claims = patent.get("claims", [])
+        claims_text = ""
+        if claims and isinstance(claims[0], dict):
+            claims_text = claims[0].get("claim_text", "")
+        
         for chunk in patent.get("chunks", []):
             chunk_data = {
-                "chunk_id": chunk.get("chunk_id"),
-                "patent_id": chunk.get("patent_id") or patent.get("publication_number"),
+                "chunk_id": chunk.get("chunk_id", ""),
+                "patent_id": patent_metadata["patent_id"],
                 "content": chunk.get("content", ""),
                 "content_type": chunk.get("chunk_type", "description"),
                 "ipc_code": (patent.get("ipc_codes") or [""])[0][:20],
-                "importance_score": patent.get("importance_score", 0.0),
+                "importance_score": patent_metadata["importance_score"],
                 "weight": 1.0,
-                "claim_number": chunk.get("metadata", {}).get("claim_number", 0),
-                "rag_components": json.dumps(chunk.get("rag_components", [])),
+                "title": patent_metadata["title"],
+                "abstract": patent_metadata["abstract"][:500] if patent_metadata["abstract"] else "",
+                "claims": claims_text[:1000] if claims_text else "",
             }
             all_chunks.append(chunk_data)
     
     logger.info(f"Total chunks to index: {len(all_chunks)}")
     
-    # Generate embeddings
-    logger.info("Generating embeddings...")
+    if not all_chunks:
+        return InsertResult(
+            success=False,
+            inserted_count=0,
+            index_path=str(faiss_client.config.index_path),
+            error_message="No chunks to index",
+        )
     
-    embedding_items = [
-        {
-            "id": c["chunk_id"],
-            "text": c["content"],
-            "type": c["content_type"],
-        }
-        for c in all_chunks
-    ]
-    
-    embedding_results = await embedder.embed_batch(embedding_items)
-    
-    embeddings = [r.embedding for r in embedding_results]
-    
-    # Update weights from embedder
-    for i, result in enumerate(embedding_results):
-        all_chunks[i]["weight"] = result.weight
-    
-    # Create collection if needed
-    await milvus_client.create_patents_collection(collection_name)
-    
-    # Insert
-    return await milvus_client.insert_patent_chunks(
-        all_chunks,
-        embeddings,
-        collection_name,
-    )
+    try:
+        # Generate embeddings
+        logger.info("Generating embeddings...")
+        embedding_results = await embedder.embed_patent_chunks(all_chunks)
+        
+        embeddings = np.array([r.embedding for r in embedding_results])
+        
+        for i, result in enumerate(embedding_results):
+            all_chunks[i]["weight"] = result.weight
+        
+        # Create and populate index (FAISS + BM25)
+        faiss_client.create_index(use_cosine=True)
+        faiss_client.add_vectors(embeddings, all_chunks)
+        
+        if save_to_disk:
+            faiss_client.save_local()
+        
+        return InsertResult(
+            success=True,
+            inserted_count=len(all_chunks),
+            index_path=str(faiss_client.config.index_path),
+        )
+        
+    except Exception as e:
+        logger.error(f"Index building failed: {e}")
+        return InsertResult(
+            success=False,
+            inserted_count=0,
+            index_path=str(faiss_client.config.index_path),
+            error_message=str(e),
+        )
 
 
 # =============================================================================
@@ -631,87 +705,73 @@ async def index_processed_patents(
 # =============================================================================
 
 async def main():
-    """Test Milvus operations."""
-    import sys
-    
+    """Test hybrid search operations."""
     logging.basicConfig(
         level=logging.INFO,
         format=config.logging.log_format,
     )
     
     print("\n" + "=" * 70)
-    print("🛡️  Patent Guard v2.0 - Milvus Vector DB Test")
+    print("🛡️  Patent Guard v3.0 - Hybrid Search Test")
     print("=" * 70)
     
-    if not MILVUS_AVAILABLE:
-        print("❌ pymilvus not installed. Install with: pip install pymilvus")
+    if not FAISS_AVAILABLE:
+        print("❌ faiss-cpu not installed")
+        return
+    
+    if not BM25_AVAILABLE:
+        print("❌ rank_bm25 not installed. Install with: pip install rank_bm25")
         return
     
     # Initialize client
-    client = MilvusClient()
+    client = FaissClient()
     
-    try:
-        # Connect
-        print("\n📡 Connecting to Milvus...")
-        await client.connect()
-        
-        # Get stats
-        stats = await client.get_collection_stats()
-        print(f"\n📊 Collection Stats: {stats}")
-        
-        # Create test collection
-        print("\n📦 Creating test collection...")
-        collection = await client.create_patents_collection(
-            "patent_guard_test",
-            drop_existing=True,
-        )
-        
-        # Insert test data
-        print("\n📥 Inserting test data...")
-        test_chunks = [
-            {
-                "chunk_id": "test_1",
-                "patent_id": "US-1234567-A",
-                "content": "A method for retrieval-augmented generation...",
-                "content_type": "claim",
-                "ipc_code": "G06N3",
-                "importance_score": 10.0,
-                "weight": 2.0,
-                "claim_number": 1,
-                "rag_components": '["retriever", "generator"]',
-            },
-        ]
-        
-        test_embeddings = [np.random.randn(4096).astype(np.float32)]
-        
-        result = await client.insert_patent_chunks(
-            test_chunks,
-            test_embeddings,
-            "patent_guard_test",
-        )
-        
-        print(f"   Inserted: {result.inserted_count}")
-        
-        # Search
-        print("\n🔍 Testing search...")
-        search_results = await client.search(
-            query_embedding=np.random.randn(4096).astype(np.float32),
-            collection_name="patent_guard_test",
-            top_k=5,
-        )
-        
-        print(f"   Found: {len(search_results)} results")
-        
-        # Cleanup
-        print("\n🧹 Cleaning up test collection...")
-        await asyncio.get_event_loop().run_in_executor(
-            None, lambda: utility.drop_collection("patent_guard_test")
-        )
-        
-        print("\n✅ Milvus test complete!")
-        
-    finally:
-        await client.disconnect()
+    # Test data
+    print("\n📦 Creating test index...")
+    client.create_index(use_cosine=True)
+    
+    n_vectors = 100
+    dim = config.embedding.embedding_dim
+    test_embeddings = np.random.randn(n_vectors, dim).astype(np.float32)
+    
+    test_metadata = [
+        {
+            "chunk_id": f"test_chunk_{i}",
+            "patent_id": f"US-{1000000 + i}-A",
+            "content": f"Method for neural network based retrieval system using vector embedding and semantic search technology claim {i}",
+            "content_type": "claim" if i % 3 == 0 else "abstract",
+            "ipc_code": "G06N3",
+            "importance_score": float(i % 10),
+            "title": f"Neural Network Retrieval System Patent {i}",
+        }
+        for i in range(n_vectors)
+    ]
+    
+    print(f"📥 Adding {n_vectors} test vectors...")
+    client.add_vectors(test_embeddings, test_metadata)
+    
+    stats = client.get_stats()
+    print(f"📊 Index stats: {stats}")
+    
+    # Test hybrid search
+    print("\n🔍 Testing hybrid search...")
+    query_embedding = test_embeddings[0]
+    query_text = "neural network semantic search retrieval"
+    
+    results = client.hybrid_search(query_embedding, query_text, top_k=5)
+    
+    print(f"   Found: {len(results)} results")
+    for r in results[:5]:
+        print(f"   - {r.patent_id}: RRF={r.rrf_score:.4f} (dense={r.dense_score:.4f}, sparse={r.sparse_score:.4f})")
+    
+    # Test keyword extraction
+    print("\n🔑 Testing keyword extraction...")
+    keywords = KeywordExtractor.extract(query_text)
+    print(f"   Keywords: {keywords}")
+    
+    print("\n" + "=" * 70)
+    print("✅ Hybrid search test complete!")
+    print("=" * 70)
 
 
 if __name__ == "__main__":

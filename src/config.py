@@ -1,7 +1,7 @@
 """
-Patent Guard v2.0 - Configuration Module
-=========================================
-Central configuration for BigQuery, embedding models, and data pipeline settings.
+Patent Guard v2.0 - Configuration Module (Antigravity Edition)
+================================================================
+Lightweight configuration for OpenAI API + FAISS in-memory architecture.
 
 Author: Patent Guard Team
 License: MIT
@@ -29,9 +29,10 @@ RAW_DATA_DIR = DATA_DIR / "raw"
 PROCESSED_DATA_DIR = DATA_DIR / "processed"
 TRIPLETS_DIR = DATA_DIR / "triplets"
 EMBEDDINGS_DIR = DATA_DIR / "embeddings"
+INDEX_DIR = DATA_DIR / "index"
 
 # Create directories if they don't exist
-for dir_path in [DATA_DIR, RAW_DATA_DIR, PROCESSED_DATA_DIR, TRIPLETS_DIR, EMBEDDINGS_DIR]:
+for dir_path in [DATA_DIR, RAW_DATA_DIR, PROCESSED_DATA_DIR, TRIPLETS_DIR, EMBEDDINGS_DIR, INDEX_DIR]:
     dir_path.mkdir(parents=True, exist_ok=True)
 
 
@@ -133,24 +134,27 @@ class DomainConfig:
 
 
 # =============================================================================
-# Embedding Model Configuration
+# Embedding Model Configuration (OpenAI API)
 # =============================================================================
 
 @dataclass
 class EmbeddingConfig:
-    """Embedding model and vector configuration."""
+    """OpenAI Embedding configuration."""
     
-    # Model
-    model_id: str = "octen/Octen-Embedding-8B"
-    embedding_dim: int = 4096
-    max_context_length: int = 32768  # 32k tokens
+    # Model - OpenAI text-embedding-3-small
+    model_id: str = "text-embedding-3-small"
+    embedding_dim: int = 1536  # OpenAI dimension
+    max_context_length: int = 8191  # text-embedding-3-small limit
     
-    # Intel XPU optimization
-    use_int4_quantization: bool = True
-    device: str = "xpu"  # "xpu" for Intel, "cuda" for NVIDIA, "cpu" for fallback
+    # API settings
+    api_key: str = os.environ.get("OPENAI_API_KEY", "")
     
-    # Batch processing
-    batch_size: int = 4  # Adjust based on VRAM
+    # Batch processing (OpenAI has 2048 texts per batch limit)
+    batch_size: int = 100
+    
+    # Rate limiting
+    requests_per_minute: int = 3000  # OpenAI tier limit
+    tokens_per_minute: int = 1_000_000
     
     # Weighting for hybrid indexing
     title_weight: float = 1.5      # Higher weight for titles
@@ -160,31 +164,28 @@ class EmbeddingConfig:
 
 
 # =============================================================================
-# Vector Database Configuration
+# FAISS Vector Database Configuration
 # =============================================================================
 
 @dataclass
-class MilvusConfig:
-    """Milvus vector database configuration."""
+class FaissConfig:
+    """FAISS in-memory vector database configuration."""
     
-    # Connection
-    host: str = "localhost"
-    port: int = 19530
+    # Index file paths
+    index_path: Path = field(default_factory=lambda: INDEX_DIR / "patent_index.bin")
+    metadata_path: Path = field(default_factory=lambda: INDEX_DIR / "patent_metadata.pkl")
     
-    # Collection names
-    patents_collection: str = "patent_guard_patents"
-    claims_collection: str = "patent_guard_claims"
-    triplets_collection: str = "patent_guard_triplets"
-    
-    # Index configuration (for 4096-dim vectors)
-    index_type: str = "IVF_FLAT"  # Use IVF_PQ for larger datasets
-    metric_type: str = "COSINE"
-    nlist: int = 1024  # Number of cluster units
+    # Index type
+    # - "Flat": Exact search (best for < 100K vectors)
+    # - "IVF": Approximate search (for larger datasets)
+    index_type: str = "Flat"
     
     # Search configuration
-    search_params: dict = field(default_factory=lambda: {
-        "nprobe": 16,  # Number of units to search
-    })
+    top_k_default: int = 10
+    
+    # For IVF indexes (not used with Flat)
+    nlist: int = 100  # Number of clusters
+    nprobe: int = 10  # Number of clusters to search
 
 
 # =============================================================================
@@ -213,9 +214,9 @@ class PAINETConfig:
 
 @dataclass
 class SelfRAGConfig:
-    """Self-RAG training data generation configuration."""
+    """Self-RAG analysis configuration using OpenAI."""
     
-    # OpenAI API for critique generation
+    # OpenAI API for analysis
     openai_model: str = "gpt-4o-mini"  # Cost-effective, fast
     openai_api_key: str = os.environ.get("OPENAI_API_KEY", "")
     
@@ -254,6 +255,22 @@ class SelfRAGConfig:
 
 
 # =============================================================================
+# Pipeline Configuration
+# =============================================================================
+
+@dataclass
+class PipelineConfig:
+    """Pipeline execution configuration."""
+    
+    # Concurrency limits (for i5-1340P: 4P + 8E cores)
+    max_workers: int = 8  # Limit to prevent UI freezing
+    
+    # Pre-computation mode
+    precompute_embeddings: bool = True
+    save_index_to_disk: bool = True
+
+
+# =============================================================================
 # Logging Configuration
 # =============================================================================
 
@@ -282,9 +299,10 @@ class PatentGuardConfig:
     bigquery: BigQueryConfig = field(default_factory=BigQueryConfig)
     domain: DomainConfig = field(default_factory=DomainConfig)
     embedding: EmbeddingConfig = field(default_factory=EmbeddingConfig)
-    milvus: MilvusConfig = field(default_factory=MilvusConfig)
+    faiss: FaissConfig = field(default_factory=FaissConfig)
     painet: PAINETConfig = field(default_factory=PAINETConfig)
     self_rag: SelfRAGConfig = field(default_factory=SelfRAGConfig)
+    pipeline: PipelineConfig = field(default_factory=PipelineConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
 
 
@@ -309,13 +327,14 @@ def update_config_from_env() -> PatentGuardConfig:
     
     # OpenAI API
     if os.environ.get("OPENAI_API_KEY"):
+        config.embedding.api_key = os.environ["OPENAI_API_KEY"]
         config.self_rag.openai_api_key = os.environ["OPENAI_API_KEY"]
     
-    # Milvus
-    if os.environ.get("MILVUS_HOST"):
-        config.milvus.host = os.environ["MILVUS_HOST"]
-    if os.environ.get("MILVUS_PORT"):
-        config.milvus.port = int(os.environ["MILVUS_PORT"])
+    # FAISS paths
+    if os.environ.get("FAISS_INDEX_PATH"):
+        config.faiss.index_path = Path(os.environ["FAISS_INDEX_PATH"])
+    if os.environ.get("FAISS_METADATA_PATH"):
+        config.faiss.metadata_path = Path(os.environ["FAISS_METADATA_PATH"])
     
     return config
 
@@ -323,7 +342,7 @@ def update_config_from_env() -> PatentGuardConfig:
 def print_config_summary() -> None:
     """Print configuration summary."""
     print("\n" + "=" * 70)
-    print("🛡️  Patent Guard v2.0 - Configuration Summary")
+    print("🛡️  Patent Guard v2.0 - Configuration Summary (Antigravity Mode)")
     print("=" * 70)
     print(f"\n📊 BigQuery:")
     print(f"   Project: {config.bigquery.project_id}")
@@ -334,18 +353,18 @@ def print_config_summary() -> None:
     print(f"   Keywords: {len(config.domain.keywords)} terms")
     print(f"   IPC Codes: {', '.join(config.domain.ipc_codes)}")
     
-    print(f"\n🧠 Embedding:")
+    print(f"\n🧠 Embedding (OpenAI API):")
     print(f"   Model: {config.embedding.model_id}")
     print(f"   Dimension: {config.embedding.embedding_dim}")
-    print(f"   Device: {config.embedding.device}")
+    print(f"   API Key: {'✅ Set' if config.embedding.api_key else '❌ Not set'}")
     
-    print(f"\n🗄️  Milvus:")
-    print(f"   Host: {config.milvus.host}:{config.milvus.port}")
-    print(f"   Collections: patents, claims, triplets")
+    print(f"\n🗄️  FAISS (In-Memory):")
+    print(f"   Index Path: {config.faiss.index_path}")
+    print(f"   Index Type: {config.faiss.index_type}")
     
-    print(f"\n🔗 PAI-NET:")
-    print(f"   Min Citations for Anchor: {config.painet.min_citations_for_anchor}")
-    print(f"   Negatives per Positive: {config.painet.negatives_per_positive}")
+    print(f"\n⚡ Pipeline:")
+    print(f"   Max Workers: {config.pipeline.max_workers}")
+    print(f"   Pre-compute Mode: {config.pipeline.precompute_embeddings}")
     
     print("=" * 70 + "\n")
 

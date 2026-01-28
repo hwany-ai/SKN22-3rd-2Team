@@ -1,15 +1,15 @@
 """
-Patent Guard v2.0 - Main Pipeline Orchestrator
-================================================
-Orchestrates the complete patent data pipeline.
+Patent Guard v2.0 - Main Pipeline Orchestrator (Antigravity Edition)
+=====================================================================
+Orchestrates the complete patent data pipeline with FAISS indexing.
 
 Pipeline stages:
 1. BigQuery extraction
 2. Preprocessing & chunking
-3. PAI-NET triplet generation
-4. Embedding generation
-5. Vector DB indexing
-6. Self-RAG training data generation
+3. PAI-NET triplet generation (optional)
+4. Embedding generation (OpenAI API)
+5. FAISS index building (Pre-computation)
+6. Self-RAG training data generation (optional)
 
 Author: Patent Guard Team
 License: MIT
@@ -19,9 +19,22 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from datetime import datetime
 from typing import Optional
+
+# Use orjson for faster JSON I/O
+try:
+    import orjson
+    def json_load(f): return orjson.loads(f.read())
+    def json_dump(obj, f): f.write(orjson.dumps(obj, option=orjson.OPT_INDENT_2))
+except ImportError:
+    import json
+    def json_load(f): return json.load(f)
+    def json_dump(obj, f): json.dump(obj, f, ensure_ascii=False, indent=2)
+
+import numpy as np
 
 from config import (
     config,
@@ -30,6 +43,8 @@ from config import (
     RAW_DATA_DIR,
     PROCESSED_DATA_DIR,
     TRIPLETS_DIR,
+    EMBEDDINGS_DIR,
+    INDEX_DIR,
 )
 
 # =============================================================================
@@ -99,19 +114,21 @@ async def stage_2_preprocessing(
     """
     Stage 2: Preprocess patents with claim parsing and chunking.
     
+    Uses ProcessPoolExecutor with limited workers for CPU efficiency.
+    
     Returns:
         Path to processed data file
     """
-    import json
     from preprocessor import PatentPreprocessor
     
     print("\n" + "=" * 70)
     print("🔧 Stage 2: Patent Preprocessing")
+    print(f"   Max Workers: {config.pipeline.max_workers}")
     print("=" * 70)
     
     # Load raw data
-    with open(input_path, 'r', encoding='utf-8') as f:
-        raw_patents = json.load(f)
+    with open(input_path, 'rb') as f:
+        raw_patents = json_load(f)
     
     print(f"📂 Loaded {len(raw_patents)} raw patents")
     
@@ -140,7 +157,6 @@ async def stage_3_triplet_generation(
     Returns:
         Path to triplets file
     """
-    import json
     from triplet_generator import PAINETTripletGenerator
     
     print("\n" + "=" * 70)
@@ -148,8 +164,8 @@ async def stage_3_triplet_generation(
     print("=" * 70)
     
     # Load processed data
-    with open(input_path, 'r', encoding='utf-8') as f:
-        processed_patents = json.load(f)
+    with open(input_path, 'rb') as f:
+        processed_patents = json_load(f)
     
     print(f"📂 Loaded {len(processed_patents)} processed patents")
     
@@ -171,23 +187,22 @@ async def stage_4_embedding(
     input_path: Path,
 ) -> Optional[Path]:
     """
-    Stage 4: Generate embeddings for patent chunks.
+    Stage 4: Generate embeddings using OpenAI API.
     
     Returns:
         Path to embeddings file
     """
-    import json
-    import numpy as np
-    from embedder import PatentEmbedder
-    from config import EMBEDDINGS_DIR
+    from embedder import OpenAIEmbedder
     
     print("\n" + "=" * 70)
-    print("🧠 Stage 4: Embedding Generation")
+    print("🧠 Stage 4: Embedding Generation (OpenAI API)")
+    print(f"   Model: {config.embedding.model_id}")
+    print(f"   Dimension: {config.embedding.embedding_dim}")
     print("=" * 70)
     
     # Load processed data
-    with open(input_path, 'r', encoding='utf-8') as f:
-        processed_patents = json.load(f)
+    with open(input_path, 'rb') as f:
+        processed_patents = json_load(f)
     
     # Extract all chunks
     all_chunks = []
@@ -198,7 +213,7 @@ async def stage_4_embedding(
     print(f"📂 Total chunks to embed: {len(all_chunks)}")
     
     # Initialize embedder
-    embedder = PatentEmbedder()
+    embedder = OpenAIEmbedder()
     
     # Generate embeddings
     results = await embedder.embed_patent_chunks(all_chunks)
@@ -228,22 +243,23 @@ async def stage_5_vector_indexing(
     embeddings_path: Path,
 ) -> bool:
     """
-    Stage 5: Index embeddings in Milvus vector database.
+    Stage 5: Build FAISS index from embeddings (Pre-computation).
+    
+    This creates the in-memory index that will be loaded at app startup.
     
     Returns:
         True if successful
     """
-    import json
-    import numpy as np
-    from vector_db import MilvusClient
+    from vector_db import FaissClient
     
     print("\n" + "=" * 70)
-    print("🗄️  Stage 5: Vector Database Indexing")
+    print("🗄️  Stage 5: FAISS Index Building (Pre-computation)")
+    print(f"   Index Path: {config.faiss.index_path}")
     print("=" * 70)
     
     # Load data
-    with open(processed_path, 'r', encoding='utf-8') as f:
-        processed_patents = json.load(f)
+    with open(processed_path, 'rb') as f:
+        processed_patents = json_load(f)
     
     data = np.load(embeddings_path)
     embeddings = data['embeddings']
@@ -251,69 +267,93 @@ async def stage_5_vector_indexing(
     
     print(f"📂 Loaded {len(embeddings)} embeddings")
     
-    # Build chunk lookup
+    # Build chunk lookup with full patent metadata
     chunk_lookup = {}
     for patent in processed_patents:
+        patent_id = patent.get("publication_number", "")
+        title = patent.get("title", "")
+        abstract = patent.get("abstract", "")
+        ipc_codes = patent.get("ipc_codes", [])
+        importance_score = patent.get("importance_score", 0.0)
+        
+        # Get claims text
+        claims = patent.get("claims", [])
+        claims_text = ""
+        if claims and isinstance(claims[0], dict):
+            claims_text = claims[0].get("claim_text", "")
+        
         for chunk in patent.get("chunks", []):
-            chunk_lookup[chunk["chunk_id"]] = {
-                **chunk,
-                "ipc_code": (patent.get("ipc_codes") or [""])[0][:20],
-                "importance_score": patent.get("importance_score", 0.0),
+            chunk_id = chunk.get("chunk_id", "")
+            chunk_lookup[chunk_id] = {
+                "chunk_id": chunk_id,
+                "patent_id": patent_id,
+                "content": chunk.get("content", ""),
+                "content_type": chunk.get("chunk_type", "description"),
+                "ipc_code": (ipc_codes[0] if ipc_codes else "")[:20],
+                "importance_score": importance_score,
+                "weight": 1.0,
+                "title": title,
+                "abstract": abstract[:500] if abstract else "",
+                "claims": claims_text[:1000] if claims_text else "",
             }
     
-    # Prepare data for insertion
-    chunks = [chunk_lookup.get(cid, {"chunk_id": cid}) for cid in chunk_ids]
-    
-    # Initialize Milvus client
-    client = MilvusClient()
-    
-    try:
-        await client.create_patents_collection(drop_existing=True)
-        
-        result = await client.insert_patent_chunks(
-            chunks,
-            embeddings.tolist(),
-        )
-        
-        if result.success:
-            print(f"✅ Vector indexing complete:")
-            print(f"   Inserted: {result.inserted_count}")
-            return True
+    # Prepare metadata for each embedding
+    metadata_list = []
+    for cid in chunk_ids:
+        if cid in chunk_lookup:
+            metadata_list.append(chunk_lookup[cid])
         else:
-            print(f"❌ Indexing failed: {result.error_message}")
-            return False
-            
-    finally:
-        await client.disconnect()
+            metadata_list.append({
+                "chunk_id": cid,
+                "patent_id": "",
+                "content": "",
+                "content_type": "unknown",
+            })
+    
+    # Initialize FAISS client and create index
+    client = FaissClient()
+    client.create_index(use_cosine=True)
+    
+    # Add vectors
+    added = client.add_vectors(embeddings, metadata_list)
+    
+    if added > 0:
+        # Save to disk
+        client.save_local()
+        
+        stats = client.get_stats()
+        print(f"✅ FAISS indexing complete:")
+        print(f"   Total vectors: {stats['total_vectors']}")
+        print(f"   Index type: {stats['index_type']}")
+        print(f"   Saved to: {config.faiss.index_path}")
+        return True
+    else:
+        print("❌ Indexing failed: No vectors added")
+        return False
 
 
 async def stage_6_selfrag_generation(
     input_path: Path,
 ) -> Optional[Path]:
     """
-    Stage 6: Generate Self-RAG training data using Gemini.
+    Stage 6: Generate Self-RAG training data using OpenAI.
     
     Returns:
         Path to training data file
     """
-    import json
-    from self_rag_generator import SelfRAGDataGenerator, GENAI_AVAILABLE
+    from self_rag_generator import SelfRAGDataGenerator
     
     print("\n" + "=" * 70)
     print("📝 Stage 6: Self-RAG Training Data Generation")
     print("=" * 70)
     
-    if not GENAI_AVAILABLE:
-        print("⚠️  google-generativeai not available. Skipping...")
-        return None
-    
-    if not config.self_rag.gemini_api_key:
-        print("⚠️  GOOGLE_API_KEY not set. Skipping...")
+    if not config.self_rag.openai_api_key:
+        print("⚠️  OPENAI_API_KEY not set. Skipping...")
         return None
     
     # Load processed data
-    with open(input_path, 'r', encoding='utf-8') as f:
-        processed_patents = json.load(f)
+    with open(input_path, 'rb') as f:
+        processed_patents = json_load(f)
     
     print(f"📂 Loaded {len(processed_patents)} processed patents")
     
@@ -352,7 +392,7 @@ async def run_full_pipeline(
     skip_stages = skip_stages or []
     
     print("\n" + "=" * 70)
-    print("🛡️  Patent Guard v2.0 - Full Pipeline Execution")
+    print("🛡️  Patent Guard v2.0 - Full Pipeline (Antigravity Mode)")
     print("=" * 70)
     
     # Update config from environment
@@ -397,19 +437,25 @@ async def run_full_pipeline(
                 processed_path = max(processed_files, key=lambda p: p.stat().st_mtime)
                 print(f"📂 Using existing processed data: {processed_path}")
         
-        # Stage 3: Triplet Generation
+        # Stage 3: Triplet Generation (optional)
         if 3 not in skip_stages and processed_path:
             triplets_path = await stage_3_triplet_generation(processed_path)
         
         # Stage 4: Embedding Generation
         if 4 not in skip_stages and processed_path:
             embeddings_path = await stage_4_embedding(processed_path)
+        else:
+            # Look for existing embeddings
+            embed_files = list(EMBEDDINGS_DIR.glob("embeddings_*.npz"))
+            if embed_files:
+                embeddings_path = max(embed_files, key=lambda p: p.stat().st_mtime)
+                print(f"📂 Using existing embeddings: {embeddings_path}")
         
-        # Stage 5: Vector Indexing
+        # Stage 5: FAISS Indexing (Pre-computation)
         if 5 not in skip_stages and processed_path and embeddings_path:
             await stage_5_vector_indexing(processed_path, embeddings_path)
         
-        # Stage 6: Self-RAG Training Data
+        # Stage 6: Self-RAG Training Data (optional)
         if 6 not in skip_stages and processed_path:
             selfrag_path = await stage_6_selfrag_generation(processed_path)
         
@@ -426,6 +472,8 @@ async def run_full_pipeline(
             print(f"   Triplets: {triplets_path}")
         if embeddings_path:
             print(f"   Embeddings: {embeddings_path}")
+        if config.faiss.index_path.exists():
+            print(f"   FAISS Index: {config.faiss.index_path}")
         if selfrag_path:
             print(f"   Self-RAG: {selfrag_path}")
         
@@ -440,11 +488,10 @@ async def run_full_pipeline(
 
 async def main():
     """Main entry point."""
-    import sys
     import argparse
     
     parser = argparse.ArgumentParser(
-        description="Patent Guard v2.0 - Patent Data Pipeline"
+        description="Patent Guard v2.0 - Patent Data Pipeline (Antigravity Mode)"
     )
     
     parser.add_argument(
@@ -459,7 +506,7 @@ async def main():
         type=int,
         nargs="*",
         default=[],
-        help="Stages to skip (e.g., --skip 5 6)",
+        help="Stages to skip (e.g., --skip 3 6)",
     )
     
     parser.add_argument(
@@ -508,8 +555,17 @@ async def main():
             if input_path:
                 await stage_4_embedding(input_path)
         elif args.stage == 5:
-            print("Stage 5 requires both processed data and embeddings paths.")
-            print("Use full pipeline instead.")
+            # Find both processed data and embeddings
+            proc_files = list(PROCESSED_DATA_DIR.glob("processed_*.json"))
+            embed_files = list(EMBEDDINGS_DIR.glob("embeddings_*.npz"))
+            
+            if proc_files and embed_files:
+                processed_path = max(proc_files, key=lambda p: p.stat().st_mtime)
+                embeddings_path = max(embed_files, key=lambda p: p.stat().st_mtime)
+                await stage_5_vector_indexing(processed_path, embeddings_path)
+            else:
+                print("❌ Stage 5 requires both processed data and embeddings.")
+                print("   Run stages 2 and 4 first.")
         elif args.stage == 6:
             if not input_path:
                 proc_files = list(PROCESSED_DATA_DIR.glob("processed_*.json"))
