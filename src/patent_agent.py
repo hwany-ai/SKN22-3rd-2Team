@@ -183,34 +183,36 @@ class PatentAgent:
     4. Critical CoT Analysis with Streaming
     """
     
-    def __init__(self, faiss_client=None):
+    def __init__(self, db_client=None):
         if not OPENAI_API_KEY:
             raise ValueError("OPENAI_API_KEY not set. Check .env file.")
         
         self.client = AsyncOpenAI(api_key=OPENAI_API_KEY)
         
-        # Initialize FAISS client with hybrid search
-        if faiss_client is not None:
-            self.faiss_client = faiss_client
+        # Initialize Vector DB client with hybrid search
+        if db_client is not None:
+            self.db_client = db_client
         else:
-            from vector_db import FaissClient
-            self.faiss_client = FaissClient()
-            self._try_load_index()
+            # Use PineconeClient for v3.0 Migration
+            from vector_db import PineconeClient
+            self.db_client = PineconeClient()
+            self._try_load_local_cache()
     
-    def _try_load_index(self) -> bool:
-        """Try to load pre-computed FAISS + BM25 index."""
-        loaded = self.faiss_client.load_local()
+    def _try_load_local_cache(self) -> bool:
+        """Try to load local metadata cache and BM25 index."""
+        loaded = self.db_client.load_local()
         if loaded:
-            stats = self.faiss_client.get_stats()
-            logger.info(f"Loaded hybrid index: {stats['total_vectors']} vectors, BM25: {stats.get('bm25_docs', 0)} docs")
+            stats = self.db_client.get_stats()
+            logger.info(f"Loaded local cache: {stats.get('bm25_docs', 0)} docs in BM25")
             return True
         else:
-            logger.warning("No pre-computed index found. Run pipeline first.")
+            logger.warning("No local cache found. Run pipeline to build BM25 index.")
             return False
     
     def index_loaded(self) -> bool:
-        """Check if index is loaded and has vectors."""
-        return self.faiss_client.index is not None and self.faiss_client.index.ntotal > 0
+        """Check if DB is ready."""
+        # For Pinecone, we assume it's always ready if initialized
+        return True
     
     # =========================================================================
     # Keyword Extraction for Hybrid Search
@@ -304,7 +306,7 @@ class PatentAgent:
         
         # Search
         if use_hybrid:
-            search_results = await self.faiss_client.async_hybrid_search(
+            search_results = await self.db_client.async_hybrid_search(
                 query_embedding,
                 query_text,
                 top_k=top_k,
@@ -312,7 +314,7 @@ class PatentAgent:
                 sparse_weight=SPARSE_WEIGHT,
             )
         else:
-            search_results = await self.faiss_client.async_search(query_embedding, top_k=top_k)
+            search_results = await self.db_client.async_search(query_embedding, top_k=top_k)
         
         # Convert to PatentSearchResult
         results = []
@@ -730,6 +732,8 @@ JSON 형식으로 응답:
                 {
                     "patent_id": r.publication_number,
                     "title": r.title,
+                    "abstract": r.abstract,  # Added for DeepEval Faithfulness
+                    "claims": r.claims,      # Added for DeepEval Faithfulness
                     "grading_score": r.grading_score,
                     "grading_reason": r.grading_reason,
                     "dense_score": r.dense_score,

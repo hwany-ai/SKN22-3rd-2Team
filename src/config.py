@@ -176,8 +176,6 @@ class FaissConfig:
     metadata_path: Path = field(default_factory=lambda: INDEX_DIR / "patent_metadata.pkl")
     
     # Index type
-    # - "Flat": Exact search (best for < 100K vectors)
-    # - "IVF": Approximate search (for larger datasets)
     index_type: str = "Flat"
     
     # Search configuration
@@ -186,6 +184,33 @@ class FaissConfig:
     # For IVF indexes (not used with Flat)
     nlist: int = 100  # Number of clusters
     nprobe: int = 10  # Number of clusters to search
+
+
+# =============================================================================
+# Pinecone Configuration
+# =============================================================================
+
+@dataclass
+class PineconeConfig:
+    """Pinecone vector database configuration (Serverless)."""
+    
+    # API Key (from environment variable)
+    api_key: str = os.environ.get("PINECONE_API_KEY", "")
+    
+    # Index Settings
+    index_name: str = "patent-guard-v3"
+    dimension: int = 1536  # Must match embedding model
+    metric: str = "cosine"  # or "dotproduct"
+    
+    # Cloud Settings (Serverless)
+    cloud: str = "aws"
+    region: str = "us-east-1"
+    
+    # Batch processing
+    batch_size: int = 100  # Recommended batch size for upsert
+    
+    # Namespace
+    namespace: str = "default"
 
 
 # =============================================================================
@@ -300,6 +325,7 @@ class PatentGuardConfig:
     domain: DomainConfig = field(default_factory=DomainConfig)
     embedding: EmbeddingConfig = field(default_factory=EmbeddingConfig)
     faiss: FaissConfig = field(default_factory=FaissConfig)
+    pinecone: PineconeConfig = field(default_factory=PineconeConfig)
     painet: PAINETConfig = field(default_factory=PAINETConfig)
     self_rag: SelfRAGConfig = field(default_factory=SelfRAGConfig)
     pipeline: PipelineConfig = field(default_factory=PipelineConfig)

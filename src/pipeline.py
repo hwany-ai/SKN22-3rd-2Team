@@ -243,18 +243,18 @@ async def stage_5_vector_indexing(
     embeddings_path: Path,
 ) -> bool:
     """
-    Stage 5: Build FAISS index from embeddings (Pre-computation).
+    Stage 5: Upload vectors to Pinecone (Migration).
     
-    This creates the in-memory index that will be loaded at app startup.
+    This uploads pre-computed embeddings to Pinecone Serverless index.
     
     Returns:
         True if successful
     """
-    from vector_db import FaissClient
+    from vector_db import PineconeClient
     
     print("\n" + "=" * 70)
-    print("🗄️  Stage 5: FAISS Index Building (Pre-computation)")
-    print(f"   Index Path: {config.faiss.index_path}")
+    print("🗄️  Stage 5: Pinecone Vector Indexing (Serverless)")
+    print(f"   Index Name: {config.pinecone.index_name}")
     print("=" * 70)
     
     # Load data
@@ -310,23 +310,27 @@ async def stage_5_vector_indexing(
                 "content_type": "unknown",
             })
     
-    # Initialize FAISS client and create index
-    client = FaissClient()
-    client.create_index(use_cosine=True)
+    # Initialize Pinecone client
+    client = PineconeClient()
     
-    # Add vectors
-    added = client.add_vectors(embeddings, metadata_list)
+    # Add vectors (Upsert to Pinecone)
+    # Note: This will also build local BM25 index
+    added_count = client.add_vectors(embeddings, metadata_list)
     
-    if added > 0:
-        # Save to disk
+    if added_count > 0:
+        # Save local cache (BM25 + Metadata)
         client.save_local()
         
-        stats = client.get_stats()
-        print(f"✅ FAISS indexing complete:")
-        print(f"   Total vectors: {stats['total_vectors']}")
-        print(f"   Index type: {stats['index_type']}")
-        print(f"   Saved to: {config.faiss.index_path}")
-        return True
+        try:
+            stats = client.get_stats()
+            print(f"✅ Pinecone indexing complete:")
+            print(f"   Upserted vectors: {added_count}")
+            print(f"   Total vectors in index: {stats.get('total_vectors', 'N/A')}")
+            print(f"   Local cache saved to: {INDEX_DIR}")
+            return True
+        except Exception as e:
+            print(f"✅ Indexing likely succeeded, but stats failed: {e}")
+            return True
     else:
         print("❌ Indexing failed: No vectors added")
         return False
