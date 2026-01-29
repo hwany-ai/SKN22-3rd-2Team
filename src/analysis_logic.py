@@ -21,8 +21,18 @@ async def run_analysis_streaming(agent, user_idea: str, results, output_containe
 
 
 async def run_full_analysis(user_idea: str, status_container, streaming_container, db_client, use_hybrid: bool = True):
-    """Run the complete patent analysis with streaming."""
+    """Run the complete patent analysis with streaming and caching."""
     
+    # Check for cached result first
+    user_id = st.session_state.get("user_id", "unknown")
+    if "history_manager" in st.session_state:
+        cached_result = st.session_state.history_manager.find_cached_result(user_idea, user_id)
+        if cached_result:
+            st.toast("⚡ 이미 분석된 아이디어입니다. 저장된 결과를 불러옵니다.")
+            # Small delay to make the toast noticeable and feel like a fast check
+            await asyncio.sleep(0.5)
+            return cached_result
+
     # Create agent with cached DB client
     agent = PatentAgent(db_client=db_client)
     

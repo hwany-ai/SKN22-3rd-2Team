@@ -98,6 +98,30 @@ class HistoryManager:
             print(f"Failed to load history: {e}")
             return []
 
+    def find_cached_result(self, user_idea: str, user_id: str) -> Optional[Dict]:
+        """Find the most recent identical query in history to act as a cache."""
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            
+            # Use exact match for now. In future, semantic similarity could be used.
+            c.execute('''
+                SELECT result_json FROM analysis_history 
+                WHERE user_id = ? AND user_idea = ?
+                ORDER BY id DESC LIMIT 1
+            ''', (user_id, user_idea))
+            
+            row = c.fetchone()
+            conn.close()
+            
+            if row:
+                return json.loads(row['result_json'])
+            return None
+        except Exception as e:
+            print(f"Failed to check cache: {e}")
+            return None
+
     def clear_history(self, user_id: str):
         """Delete history for specific user."""
         conn = sqlite3.connect(DB_PATH)
