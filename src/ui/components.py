@@ -19,6 +19,23 @@ def render_header():
 
 def render_sidebar(openai_api_key, db_client, db_stats):
     """Render the sidebar."""
+    
+    # Log status to terminal (not shown in UI)
+    import logging
+    logger = logging.getLogger(__name__)
+    
+    if openai_api_key:
+        logger.info("✅ OpenAI API 연결됨")
+    else:
+        logger.warning("❌ OpenAI API 키 없음")
+        
+    if db_client:
+        logger.info(f"✅ Hybrid 인덱스 로드됨 - Pinecone Connected")
+        if db_stats.get('bm25_initialized'):
+            logger.info(f"   📝 BM25 (Local): {db_stats.get('bm25_docs', 0):,}개 문서")
+    else:
+        logger.warning("⚠️ DB 연결 실패")
+    
     with st.sidebar:
         st.markdown("# ⚡ 쇼특허")
         st.markdown("### Short-Cut v3.0")
@@ -27,41 +44,31 @@ def render_sidebar(openai_api_key, db_client, db_stats):
         # Apply theme CSS (Hardcoded Ivory/Light)
         apply_theme_css()
         
-        st.divider()
+        # ----------------------------------------------------
+        # 📖 특허 가이드 (Patent Guide) - YouTube Popup
+        # ----------------------------------------------------
+        st.markdown("### 📖 특허 가이드")
+        st.caption("처음 사용하시나요? 가이드 영상을 확인하세요.")
         
-        # System Status
-        st.markdown("### ⚡ System Status")
+        @st.dialog("📖 특허 출원 가이드", width="large")
+        def show_patent_guide_popup():
+            st.write("**특허 출원 전 알아야 할 핵심 정보:**")
+            
+            # YouTube video (can be changed to relevant guide video)
+            video_url = "https://www.youtube.com/watch?v=HSWXcMSneB4"
+            st.video(video_url)
+            
+            st.write("---")
+            st.caption("닫기 버튼이나 배경을 클릭하면 팝업이 닫힙니다.")
         
-        # API Status
-        if openai_api_key:
-            st.success("✅ OpenAI API 연결됨")
-        else:
-            st.error("❌ OpenAI API 키 없음")
-            st.info("`.env` 파일에 `OPENAI_API_KEY`를 설정하세요.")
-        
-        # DB Index Status
-        if db_client:
-            st.success(f"✅ Hybrid 인덱스 로드됨")
-            st.caption(f"   🌲 Pinecone: Connected")
-            if db_stats.get('bm25_initialized'):
-                st.caption(f"   📝 BM25 (Local): {db_stats.get('bm25_docs', 0):,}개 문서")
-        else:
-            st.warning("⚠️ DB 연결 실패")
-            st.info("파이프라인을 실행하세요:\n`python src/pipeline.py --stage 5`")
+        if st.button("🎥 가이드 영상 보기", use_container_width=True):
+            show_patent_guide_popup()
         
         st.divider()
         
-        # Search Options
-        st.markdown("### 🔧 검색 옵션")
-        use_hybrid = st.toggle("하이브리드 검색 (Dense + BM25)", value=True)
-        if use_hybrid:
-            st.caption("RRF 알고리즘으로 Dense와 Sparse 결과를 융합합니다.")
-        else:
-            st.caption("Dense (벡터) 검색만 사용합니다.")
-        
-        st.divider()
-        
-        # Analysis History
+        # ----------------------------------------------------
+        # 📜 분석 히스토리
+        # ----------------------------------------------------
         st.markdown("### 📜 분석 히스토리")
         if st.session_state.analysis_history:
             for i, hist in enumerate(reversed(st.session_state.analysis_history[-5:])):
@@ -76,40 +83,18 @@ def render_sidebar(openai_api_key, db_client, db_stats):
         else:
             st.caption("아직 분석 기록이 없습니다.")
             
-            # Using absolute import for session manager in component might be cleaner if passed as arg or callback
-            # But currently sticking to app logic, session state modification should work.
-            if st.button("🗑️ 기록 삭제", use_container_width=True):
-                # This should be handled by a callback or clearing session state here
-                st.session_state.analysis_history = []
-                # Ideally, clear persistent history too via session manager
-                # For now, we assume the caller handles or we trigger rerun
-                # But components should avoid side-effects like reruns if possible. 
-                # Let's keep the button here but note that app.py might need to handle the action if complex.
-                # Actually, implementing the action here using session_state is fine.
-                from src.session_manager import clear_user_history
-                clear_user_history()
+        if st.button("🗑️ 기록 삭제", use_container_width=True):
+            st.session_state.analysis_history = []
+            from src.session_manager import clear_user_history
+            clear_user_history()
         
         st.divider()
         
-        # API Usage Guide
-        st.markdown("### 💰 API 비용 가이드")
-        st.caption("""
-        **분석 1회 예상 비용**: ~$0.01-0.03
-        
-        - HyDE: gpt-4o-mini
-        - Embed: text-embedding-3-small
-        - Grading: gpt-4o-mini
-        - Analysis: gpt-4o (Streaming)
-        """)
-        
-        st.divider()
-        
-        # User Info (Debug)
-        user_id = st.session_state.get("user_id", "unknown")
-        st.caption(f"👤 User ID: `{user_id}`")
+        # Team Info
         st.markdown("##### Team 뀨💕")
         
-        return use_hybrid
+        # Hybrid search is always enabled (removed toggle)
+        return True
 
 
 def render_search_results(result):
