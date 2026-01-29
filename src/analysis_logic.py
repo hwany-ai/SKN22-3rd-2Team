@@ -21,20 +21,36 @@ async def run_analysis_streaming(agent, user_idea: str, results, output_containe
 
 
 async def run_full_analysis(user_idea: str, status_container, streaming_container, db_client, use_hybrid: bool = True):
-    """Run the complete patent analysis with streaming and caching."""
+    """Run the complete patent analysis with streaming and semantic caching."""
     
-    # Check for cached result first
     user_id = st.session_state.get("user_id", "unknown")
+    
+    # Create agent early for embedding
+    agent = PatentAgent(db_client=db_client)
+    
+    # ========================================
+    # Semantic Cache Check
+    # ========================================
     if "history_manager" in st.session_state:
-        cached_result = st.session_state.history_manager.find_cached_result(user_idea, user_id)
+        # First, embed the user idea for semantic comparison
+        with status_container.status("🔍 캐시 확인 중...", expanded=False):
+            query_embedding = await agent.embed_text(user_idea)
+        
+        # Check semantic cache (returns tuple: result, similarity)
+        cached_result, similarity = st.session_state.history_manager.find_cached_result_semantic(
+            user_idea, user_id, query_embedding
+        )
+        
         if cached_result:
-            st.toast("⚡ 이미 분석된 아이디어입니다. 저장된 결과를 불러옵니다.")
-            # Small delay to make the toast noticeable and feel like a fast check
+            if similarity >= 1.0:
+                st.toast("⚡ 동일한 아이디어가 있습니다. 캐시된 결과를 불러옵니다.")
+            else:
+                st.toast(f"🧠 유사한 분석 결과 발견! ({similarity:.0%} 유사도) 캐시된 결과를 불러옵니다.")
             await asyncio.sleep(0.5)
             return cached_result
-
-    # Create agent with cached DB client
-    agent = PatentAgent(db_client=db_client)
+        
+        # Store embedding for later use (avoid re-embedding)
+        st.session_state._current_query_embedding = query_embedding
     
     results = []
     start_time = time.time()
