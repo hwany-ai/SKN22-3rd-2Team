@@ -38,14 +38,10 @@
 ### 2.1 4-Level 청구항 파서 (Advanced Claim Parser)
 v3.0에서 가장 강화된 기능으로, 복잡한 특허 청구항 구조를 4단계 전략으로 분해합니다.
 
-1.  **Level 1: Regex Pattern Matching**
-    - 표준 패턴(`1.`, `Claim 1:`, `제1항:`)을 통한 정밀 추출
-2.  **Level 2: Structure-Based Analysis**
-    - 들여쓰기 및 번호 체계 분석을 통한 구조 파악
-3.  **Level 3: NLP-Based Segmentation (Spacy)**
-    - 문장 경계 탐지를 통한 논리 단위 분할
-4.  **Level 4: Minimal Fallback**
-    - 문단 분리 또는 전체 텍스트 보존 (실패 방지)
+1.  **Lv 1 (Regex)**: 표준 청구항 포맷(`1.`, `Claim 1:`, `제1항:`)을 통한 고속 정밀 추출
+2.  **Lv 2 (Structure)**: 들여쓰기 및 번호 체계 분석을 통한 구조 파악
+3.  **Lv 3 (NLP)**: Spacy를 활용한 문장 경계 인식 (부정확한 줄바꿈 및 OCR 노이즈 대응)
+4.  **Lv 4 (Minimal)**: 최후의 수단으로 문단 단위 분할 또는 전체 텍스트 보존 (데이터 유실 방지)
 
 ### 2.2 계층적 청킹 (Hierarchical Chunking)
 - **Parent-Child 전략**: 특허 전체 컨텍스트(Parent)와 개별 청구항/설명 섹션(Child)을 계층적으로 관리
@@ -76,6 +72,19 @@ Dense 검색과 Sparse 검색을 결합하여 검색 정확도를 극대화하�
 
 - **Cross-Encoder Reranker**: `ms-marco-MiniLM` 모델을 사용하여 쿼리와 문서 간의 관련성을 딥러닝 기반으로 재평가 (`src/reranker.py`)
 - **Feedback Mechanism**: 사용자의 검색 만족도를 로깅하여 향후 성능 개선 데이터로 활용 (`src/feedback_logger.py`)
+
+## 5. 학습 데이터 생성 (Self-RAG Pipeline)
+
+RAG 시스템의 성능 평가와 파인튜닝을 위한 고품질 데이터셋 생성 파이프라인(`src/self_rag_generator.py`)을 내장하고 있습니다.
+
+### 5.1 Auto-Critique (GPT-4o)
+앵커(Anchor) 특허와 인용(Cited) 특허의 청구항 쌍을 생성하고, AI가 비평가(Critique)가 되어 정답셋(Ground Truth)을 생성합니다.
+
+- **Similarity**: 기술적 유사도 점수 (0-100) 및 공통 요소 식별
+- **Infringement Risk**: 침해 가능성 등급 (High/Medium/Low) 및 위험 요소 분석
+- **Design Around**: 회피 설계 전략 자동 제안
+
+이 과정에서 생성된 데이터는 `DeepEval`을 이용한 RAG 품질 평가나 향후 로컬 LLM 파인튜닝에 사용됩니다.
 
 ---
 
