@@ -54,9 +54,9 @@ GCP_PROJECT_ID=your-gcp-project-id  # BigQuery 연동 시 필요
 BigQuery 추출부터 Pinecone 업로드까지 전체 파이프라인을 실행합니다:
 ```bash
 # 전체 파이프라인 실행 (Extraction -> Preprocessing -> Embedding -> Indexing)
-python src/pipeline.py --limit 100 --execute
+python -m src.pipeline --limit 10000 --execute
 ```
-*(이미 처리된 데이터가 있다면 `python src/pipeline.py --stage 5`로 인덱싱만 수행 가능)*
+*(이미 처리된 데이터가 있다면 `python -m src.pipeline --stage 5`로 인덱싱만 수행 가능)*
 
 ### 4. 웹 앱 실행
 

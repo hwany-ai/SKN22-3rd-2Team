@@ -172,7 +172,7 @@ class PineconeClient:
         self,
         pinecone_config: PineconeConfig = None,
         embedding_dim: int = None,
-        skip_init_check: bool = True,
+        skip_init_check: bool = False,
     ):
         if not PINECONE_AVAILABLE:
             raise ImportError("pinecone is required. Install with: pip install pinecone>=3.0.0")
@@ -186,6 +186,10 @@ class PineconeClient:
             
         self.pc = Pinecone(api_key=self.config.api_key)
         
+        # Ensure index exists (Auto-creation for reset scenarios)
+        if not skip_init_check:
+            self._ensure_index_exists()
+            
         self.index = self.pc.Index(self.config.index_name)
         
         # Local metadata cache (Synchronized with FaissClient logic)

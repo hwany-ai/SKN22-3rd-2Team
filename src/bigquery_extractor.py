@@ -27,7 +27,7 @@ from google.cloud import bigquery
 from google.cloud.bigquery import QueryJobConfig
 from tqdm import tqdm
 
-from config import config, BigQueryConfig, DomainConfig
+from src.config import config, BigQueryConfig, DomainConfig
 
 # =============================================================================
 # Logging Setup
@@ -288,7 +288,7 @@ class SQLGenerator:
     
     def save_generated_sql(self, sql: str, filename: str = "generated_query.sql") -> Path:
         """Save generated SQL to file for review."""
-        from config import DATA_DIR
+        from src.config import DATA_DIR
         
         sql_dir = DATA_DIR / "sql"
         sql_dir.mkdir(parents=True, exist_ok=True)
@@ -442,7 +442,7 @@ class BigQueryExtractor:
         Returns:
             ExtractionResult with extraction status and output path
         """
-        from config import RAW_DATA_DIR
+        from src.config import RAW_DATA_DIR
         
         try:
             # Generate SQL
