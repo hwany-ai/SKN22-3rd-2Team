@@ -305,12 +305,17 @@ class PineconeClient:
                 # Store in local metadata cache as well
                 self.metadata[chunk_id] = meta
                 
-                vectors_to_upsert.append({
+                vector_payload = {
                     "id": chunk_id,
                     "values": vec.tolist(),
-                    "sparse_values": sparse, # Inject Sparse Vector
                     "metadata": {k: v for k, v in flat_meta.items() if v} # Filter out empty values
-                })
+                }
+                
+                # Only inject Sparse Vector if it has values (Pinecone requirement)
+                if sparse.get("indices") is not None and len(sparse["indices"]) > 0:
+                    vector_payload["sparse_values"] = sparse
+                
+                vectors_to_upsert.append(vector_payload)
             
             try:
                 self.index.upsert(vectors=vectors_to_upsert, namespace=self.config.namespace)
