@@ -23,6 +23,36 @@
 
 ---
 
+## 👥 팀 구성 (Team Composition)
+
+## 팀 정보: Team 뀨💕
+
+| 역할 (Role) | 이름 (Name) | 깃허브 (GitHub) | 담당 업무 (Responsibilities) |
+| :--- | :---: | :---: | :--- |
+| **Team Leader** | **한승혁** | [![GitHub](https://img.shields.io/badge/GitHub-gksshing-181717?style=flat-square&logo=github)](https://github.com/gksshing) | • 프로젝트 기획 및 전체 아키텍처(Architecture) 설계 <br> • 주요 마일스톤 관리 및 기술 스택 최종 의사결정 <br> • 팀 프로젝트 개발 워크플로우 및 프로세스 최적화 |
+| **Core Dev** | **박준석** | [![GitHub](https://img.shields.io/badge/GitHub-junseok--dev-181717?style=flat-square&logo=github)](https://github.com/junseok-dev) | • 아이디어의 실제 코드 구현 및 핵심 로직(RAG/LLM) 개발 <br> • 기술적 병목 현상 발생 시 문제 해결 및 빠른 프로토타이핑 실행 <br> • 시스템 성능 최적화 및 인프라 구축 주도 |
+| **Communication**| **이규빈** | [![GitHub](https://img.shields.io/badge/GitHub-giant0212-181717?style=flat-square&logo=github)](https://github.com/giant0212) | • 복잡한 기술 구조의 스토리텔링 및 외부 발표 자료 구성 <br> • 프로젝트 핵심 가치 전달 및 사용자 경험(UX) 시나리오 설계 <br> • 팀 프로젝트 시연 및 성과 공유 담당 |
+| **Quality Assurance**| **최정환** | [![GitHub](https://img.shields.io/badge/GitHub-hwany--ai-181717?style=flat-square&logo=github)](https://github.com/hwany-ai) | • 전체 기술 문서화(README.md) 및 세부 완성도 관리 <br> • 단위 테스트 수행 및 사용자 인터페이스(UI) 오류 검수 <br> • 프로젝트 일정 추적 및 누락된 세부 사항 보완 |
+
+---
+
+## 💬 팀 프로젝트 후기 (Team Retrospective)
+
+| 이름 | 프로젝트 후기 및 소감 |
+| :---: | :--- |
+| **한승혁** | 특허 도메인의 기술적 난제를 리랭커와 자가 검증 기반의 RAG로 도전하며, AI 에이전트의 실무적 신뢰성을 입증하는 뜻깊은 도전이었습니다. |
+| **박준석** | LLM에 대해서 배우고 처음으로 RAG를 활용한 LLM 챗봇 만드는 프로젝트였는데 생각보다 쉽지 않았고 부족한 점이 아직 매우 많다고 느낀 프로젝트였습니다. 그래도 팀장과 팀원들의 도움을 받아 해낼 수 있었던 프로젝트라고 생각합니다. |
+| **이규빈** | 특허가 워낙 복잡해서, 아이디어만으로 비슷한 특허를 제대로 찾고 판단하는 게 생각보다 어렵다는 걸 많이 느꼈습니다. |
+| **최정환** | 아직 부족한 부분이 많아 팀장리드에 잘 맞춰 팀장과 팀원들이 요청하는 부분에 대해 최선을 다했던 시간 이었습니다. |
+
+### 🚀 Key Learnings
+* ```
+
+---
+
+
+
+
 ## 🎯 프로젝트 개요
 
 **쇼특허(Short-Cut)** 는 사용자의 아이디어를 입력받아 유사한 선행 특허를 검색하고, AI 기반으로 **침해 리스크 분석** 및 **회피 전략**을 제공하는 시스템입니다.
