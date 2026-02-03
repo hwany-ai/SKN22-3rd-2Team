@@ -475,6 +475,75 @@ class PineconeClient:
         logger.info(f"Pinecone Hybrid Search(IPC={ipc_filters}): Found {len(results)} matches")
         return results
 
+    def fetch_by_ids(self, patent_ids: List[str]) -> List[SearchResult]:
+        """
+        Fetch specific patents by their publication numbers/IDs.
+        Uses Pinecone's fetch or query with filter.
+        """
+        if not patent_ids:
+            return []
+            
+        logger.info(f"Fetching specific patents: {patent_ids}")
+        
+        try:
+            # We use query with filter because patent_id is a metadata field
+            # and may not be the same as chunk_id (vector ID).
+            # One patent can have multiple chunks.
+            
+            # Note: Serverless Pinecone supports metadata filtering
+            filter_dict = {"patent_id": {"$in": patent_ids}}
+            
+            # Since we want to find the most relevant chunk for each patent
+            # but we don't have a query embedding, we'll just fetch a few chunks per patent.
+            # Usually, the first chunk of a patent contains the title/abstract/claims.
+            
+            response = self.index.query(
+                vector=[0.0] * self.embedding_dim, # Dummy vector for metadata-only filtering
+                filter=filter_dict,
+                top_k=20, # Fetch up to 20 chunks total across these patents
+                include_metadata=True,
+                namespace=self.config.namespace
+            )
+            
+            results = []
+            seen_patents = set()
+            
+            for match in response['matches']:
+                meta = match['metadata'] if match.get('metadata') else {}
+                p_id = meta.get("patent_id", "")
+                
+                # Take only the first chunk we find for each requested patent to keep it clean
+                if p_id in patent_ids and p_id not in seen_patents:
+                    seen_patents.add(p_id)
+                    chunk_id = match['id']
+                    
+                    # Local metadata might have more details
+                    local_meta = self.metadata.get(chunk_id, {})
+                    final_meta = local_meta or meta
+                    
+                    content = local_meta.get("content") or meta.get("text", "")
+                    
+                    results.append(SearchResult(
+                        chunk_id=chunk_id,
+                        patent_id=p_id,
+                        score=1.0, # Target match booster
+                        content=content,
+                        content_type=local_meta.get("content_type", "unknown"),
+                        dense_score=1.0,
+                        metadata=final_meta
+                    ))
+            
+            return results
+            
+        except Exception as e:
+            logger.error(f"Pinecone fetch_by_ids failed: {e}")
+            return []
+
+    async def async_fetch_by_ids(self, *args, **kwargs):
+        """Async wrapper."""
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, lambda: self.fetch_by_ids(*args, **kwargs))
+
     async def async_search(self, *args, **kwargs):
         """Async wrapper."""
         loop = asyncio.get_event_loop()

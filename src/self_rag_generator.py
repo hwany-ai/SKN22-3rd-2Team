@@ -44,7 +44,7 @@ try:
     OPENAI_AVAILABLE = True
 except ImportError:
     OPENAI_AVAILABLE = False
-    logger.warning("openai not installed. Install with: pip install openai")
+    logger.warning("openai 설치 필요: pip install openai")
 
 
 # =============================================================================
@@ -182,13 +182,33 @@ class OpenAICritiqueGenerator:
             cited_claim=cited_claim[:8000],
         )
         
+        # Append JSON formatting instruction
+        prompt += """
+        
+반드시 아래 JSON 포맷을 정확히 준수하여 응답해 주십시오:
+{
+  "유사도 평가": {
+    "기술적 유사성 점수": "0-100점",
+    "핵심 공통 기술 요소": ["요소1", "요소2", "요소3"]
+  },
+  "침해 리스크": {
+    "리스크 수준": "High/Medium/Low",
+    "위험 요소": "구체적인 위험 요소 설명"
+  },
+  "회피 전략": {
+    "분석 대상 특허가 선행 기술을 회피하기 위해 수정해야 할 구체적인 설계 변경 제안": ["제안1", "제안2"],
+    "구성요소의 삭제, 치환, 변경을 포함한 실질적 조언": ["조언1", "조언2"]
+  }
+}
+"""
+        
         try:
             response = await self.async_client.chat.completions.create(
                 model=self.config.openai_model,
                 messages=[
                     {
                         "role": "system",
-                        "content": "당신은 특허 분석 전문가입니다. 기술적 유사성, 침해 리스크, 회피 전략을 분석합니다."
+                        "content": "당신은 20년 경력의 특허 분쟁 대응 전문 변리사입니다. 단순히 정보를 나열하지 말고, 구성요소 대비 원칙(All Elements Rule)에 입각하여 침해 리스크를 '매우 비판적이고 보수적인' 관점에서 냉철하게 분석하십시오."
                     },
                     {
                         "role": "user",
@@ -235,18 +255,62 @@ class OpenAICritiqueGenerator:
         self,
         response: str,
     ) -> Tuple[SimilarityAssessment, InfringementRisk, DesignAroundStrategy]:
-        """Parse OpenAI response into structured sections."""
+        """Parse OpenAI response into structured sections (JSON or Markdown fallback)."""
         
-        # Extract similarity section
-        similarity = self._extract_similarity(response)
-        
-        # Extract infringement section
-        infringement = self._extract_infringement(response)
-        
-        # Extract design-around section
-        design_around = self._extract_design_around(response)
-        
-        return similarity, infringement, design_around
+        # 1. Try JSON parsing
+        try:
+            # Clean possible markdown code blocks
+            clean_response = response.strip()
+            if clean_response.startswith("```json"):
+                clean_response = clean_response[7:]
+            if clean_response.endswith("```"):
+                clean_response = clean_response[:-3]
+            
+            data = json.loads(clean_response)
+            
+            # Helper to safely get nested keys
+            def get_val(d, keys, default=None):
+                for k in keys:
+                    if isinstance(d, dict):
+                        d = d.get(k, default)
+                    else:
+                        return default
+                return d
+
+            # Similarity
+            sim_data = data.get("유사도 평가", {})
+            similarity = SimilarityAssessment(
+                score=int(str(sim_data.get("기술적 유사성 점수", "0")).replace("점", "").split("/")[0].strip()),
+                common_elements=sim_data.get("핵심 공통 기술 요소", []),
+                summary=str(sim_data)
+            )
+
+            # Infringement
+            risk_data = data.get("침해 리스크", {})
+            infringement = InfringementRisk(
+                risk_level=risk_data.get("리스크 수준", "unknown").lower(),
+                risk_factors=[risk_data.get("위험 요소", "")] if isinstance(risk_data.get("위험 요소"), str) else risk_data.get("위험 요소", []),
+                summary=str(risk_data)
+            )
+
+            # Design Around
+            design_data = data.get("회피 전략", {})
+            design_around = DesignAroundStrategy(
+                strategies=[design_data.get("분석 대상 특허가 선행 기술을 회피하기 위해 수정해야 할 구체적인 설계 변경 제안", "")] if isinstance(design_data.get("분석 대상 특허가 선행 기술을 회피하기 위해 수정해야 할 구체적인 설계 변경 제안"), str) else design_data.get("분석 대상 특허가 선행 기술을 회피하기 위해 수정해야 할 구체적인 설계 변경 제안", []),
+                alternative_approaches=[design_data.get("구성요소의 삭제, 치환, 변경을 포함한 실질적 조언", "")] if isinstance(design_data.get("구성요소의 삭제, 치환, 변경을 포함한 실질적 조언"), str) else design_data.get("구성요소의 삭제, 치환, 변경을 포함한 실질적 조언", []),
+                summary=str(design_data)
+            )
+
+            return similarity, infringement, design_around
+
+        except json.JSONDecodeError:
+            logger.warning("JSON parsing failed, falling back to regex parsing")
+            # Fallback to regex if JSON fails
+            similarity = self._extract_similarity(response)
+            infringement = self._extract_infringement(response)
+            design_around = self._extract_design_around(response)
+            
+            return similarity, infringement, design_around
     
     def _extract_similarity(self, response: str) -> SimilarityAssessment:
         """Extract 유사도 평가 section."""
@@ -401,11 +465,13 @@ class SelfRAGDataGenerator:
                 # Create training sample
                 sample = self._create_training_sample(anchor, cited, critique)
                 samples.append(sample)
+                print(f" ✅ Generated: {anchor['publication_number']} vs {cited['publication_number']} (Score: {critique.similarity.score})")
                 
                 # Rate limiting (avoid API throttling)
                 await asyncio.sleep(0.5)  # OpenAI has higher rate limits than Gemini
                 
             except Exception as e:
+                print(f"\n❌ Error processing pair {anchor['publication_number']}: {e}")
                 logger.error(f"Error processing pair {anchor['publication_number']}-{cited['publication_number']}: {e}")
                 continue
         

@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Tuple, AsyncGenerator
@@ -26,6 +27,7 @@ from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 from openai import AsyncOpenAI
 import numpy as np
+from tenacity import retry, stop_after_attempt, wait_random_exponential, retry_if_exception_type
 
 load_dotenv()
 
@@ -162,6 +164,7 @@ class PatentSearchResult:
     dense_score: float = 0.0
     sparse_score: float = 0.0
     rrf_score: float = 0.0
+    is_prioritized: bool = False  # Flag for patents explicitly mentioned in query
 
 
 # =============================================================================
@@ -230,6 +233,42 @@ class PatentAgent:
         keywords = KeywordExtractor.extract(text, max_keywords=15)
         
         return keywords
+
+    def extract_patent_ids(self, text: str) -> List[str]:
+        """
+        Extract patent IDs (e.g., CN-119821168-A, KR-102842452-B1) from text.
+        """
+        # Precise pattern for CC-NUMBER-SUFFIX or CC-NUMBER
+        pattern = r'\b([A-Z]{2}[-]?\d{4,}(?:[-][A-Z0-9]+)?)\b'
+        
+        matches = re.findall(pattern, text, re.ASCII)
+        # Filter and clean
+        cleaned = []
+        for m in matches:
+            if re.search(r'\d{4,}', m): # Ensure it has enough digits to be a patent ID
+                cleaned.append(m.upper())
+        
+        return list(set(cleaned))
+    
+    @retry(
+        wait=wait_random_exponential(min=1, max=10),
+        stop=stop_after_attempt(5),
+        retry=retry_if_exception_type(Exception),
+    )
+    async def _fetch_by_ids_safe(self, ids: List[str]) -> List[Any]:
+        """Wrapper for ID fetch with retry AND validation."""
+        results = await self.db_client.async_fetch_by_ids(ids)
+        
+        # Validation: If we requested N IDs, we expect N results (or reasonably close)
+        # Note: Pinecone might return fewer if not found, but in our Golden Dataset,
+        # we assume all IDs exist. If not found, it's likely a consistency/timeout issue.
+        if len(results) < len(ids):
+            missing_count = len(ids) - len(results)
+            # Create a custom error to trigger retry
+            raise ValueError(f"Partial retrieval detected. Requested {len(ids)}, got {len(results)}. Missing {missing_count} items.")
+            
+        return results
+
     
     # =========================================================================
     # 1. HyDE - Hypothetical Document Embedding
@@ -239,13 +278,8 @@ class PatentAgent:
         """
         Generate a hypothetical patent claim from user's idea.
         """
-        system_prompt = """당신은 20년 경력의 베테랑 특허 변리사입니다. 
-사용자의 아이디어를 바탕으로, 이 기술이 특허로 출원되었을 때의 '제1항(독립항)'을 가상으로 작성하십시오.
-
-작성 가이드라인:
-1. 전문 용어 사용: '데이터베이스' 대신 '벡터 색인 데이터 구조', '찾기' 대신 '유사도 기반 검색' 등 전문 용어를 사용하십시오.
-2. 구조화: [전제부] - [구성요소 1] - [구성요소 2] - [기능적 유기적 결합 관계] 순으로 작성하십시오.
-3. 형식: "~를 특징으로 하는 [기술 명칭]"과 같은 특허 특유의 문체를 사용하십시오.
+        system_prompt = """당신은 20년 경력의 특허 분쟁 대응 전문 변리사입니다. 
+당신의 목표는 사용자의 추상적인 아이디어를 바탕으로, 법적/기술적으로 가장 명확하고 구체적인 '독립 청구항(Independent Claim)'의 형태로 가상의 특허를 작성하는 것입니다.
 
 이 가상 청구항은 실제 특허 데이터셋에서 유사한 기술을 찾아내기 위한 검색 쿼리로 사용됩니다."""
 
@@ -332,6 +366,11 @@ JSON 형식으로 응답하십시오:
         results = await self._execute_search(hypothetical_claim, user_idea, top_k, use_hybrid)
         return hypothetical_claim, results
 
+    @retry(
+        wait=wait_random_exponential(min=1, max=10),
+        stop=stop_after_attempt(3),
+        retry=retry_if_exception_type((Exception,)), # Retry on generic exceptions usually network/pinecone related
+    )
     async def _execute_search(
         self,
         query_text: str,
@@ -388,18 +427,40 @@ JSON 형식으로 응답하십시오:
         use_hybrid: bool = True,
         ipc_filters: List[str] = None,
     ) -> Tuple[List[str], List[PatentSearchResult]]:
-        """
-        Multi-Query RAG Search.
-        Executes 3 queries in parallel and deduplicates results.
-        """
-        # 1. Generate queries (Parallel with HyDE gen if needed, but here simple sequential)
+        # 1. Detect specific patent IDs in user idea
+        target_ids = self.extract_patent_ids(user_idea)
+        target_results = []
+        if target_ids:
+            logger.info(f"Detected target patents in query: {target_ids}")
+        if target_ids:
+            logger.info(f"Detected target patents in query: {target_ids}")
+            raw_target_results = await self._fetch_by_ids_safe(target_ids)
+
+            
+            # Convert to PatentSearchResult
+            for r in raw_target_results:
+                target_results.append(PatentSearchResult(
+                    publication_number=r.patent_id,
+                    title=r.metadata.get("title", ""),
+                    abstract=r.metadata.get("abstract", r.content[:500]),
+                    claims=r.metadata.get("claims", ""),
+                    ipc_codes=[r.metadata.get("ipc_code", "")] if r.metadata.get("ipc_code") else [],
+                    similarity_score=r.score,
+                    dense_score=getattr(r, 'dense_score', 0.0),
+                    sparse_score=getattr(r, 'sparse_score', 0.0),
+                    rrf_score=getattr(r, 'rrf_score', 0.0),
+                    is_prioritized=True,  # Mark as prioritized
+                ))
+            logger.info(f"Found {len(target_results)} requested patents in DB")
+
+        # 2. Generate queries for broader search
         queries = await self.generate_multi_queries(user_idea)
         if not queries:
             queries = [user_idea]
             
         logger.info(f"Executing Multi-Query Search with: {queries}")
         
-        # 2. Parallel Execution using asyncio.gather
+        # 3. Parallel Execution using asyncio.gather
         tasks = [
             self._execute_search(query, user_idea, top_k, use_hybrid, ipc_filters=ipc_filters)
             for query in queries
@@ -407,10 +468,17 @@ JSON 형식으로 응답하십시오:
         
         results_list = await asyncio.gather(*tasks)
         
-        # 3. Deduplication & Fusion
+        # 4. Deduplication & Fusion
         seen_ids = set()
         merged_results = []
         
+        # Pre-populate with target results so they are definitely included
+        for r in target_results:
+            if r.publication_number not in seen_ids:
+                seen_ids.add(r.publication_number)
+                r.is_prioritized = True
+                merged_results.append(r)
+
         # Simple Fusion: Round-Robin or Score-based?
         # Using Score-based here (Flatten and sort by RRF/Sim score)
         all_results = [item for sublist in results_list for item in sublist]
@@ -422,6 +490,10 @@ JSON 형식으로 응답하십시오:
             if r.publication_number not in seen_ids:
                 seen_ids.add(r.publication_number)
                 merged_results.append(r)
+            else:
+                # If it's a target patent seen again, ensure the is_prioritized flag is preserved
+                # if it was already marked as such in merged_results
+                pass
         
         logger.info(f"Multi-Query: {len(all_results)} total -> {len(merged_results)} unique results")
         return queries, merged_results[:top_k*2]  # Return more candidates for grading
@@ -447,8 +519,7 @@ JSON 형식으로 응답하십시오:
             for i, r in enumerate(results)
         ])
         
-        system_prompt = """당신은 선행 기술 조사를 수행하는 고도로 숙련된 특허 심사관입니다.
-검색된 특허가 사용자의 아이디어와 기술적으로 실질적인 관련이 있는지 평가하십시오.
+        system_prompt = """당신은 20년 경력의 특허 분쟁 대응 전문 변리사입니다. 당신의 목표는 검색된 특허가 사용자의 아이디어와 기술적으로 실질적인 관련이 있는지를 '매우 비판적이고 보수적인' 관점에서 평가하는 것입니다.
 
 평가 지침:
 1. **기술적 실현 가능성 및 논리**: 아이디어가 논리적으로 성립하지 않거나(예: 전혀 다른 성질의 기술이 물리적/생물학적으로 결합 불가한 경우), 단순한 키워드 짜집기인 경우 낮은 점수를 부여하십시오.
@@ -493,13 +564,32 @@ JSON 형식으로 응답하십시오:
             for grade in grading_response.results:
                 for result in results:
                     if result.publication_number == grade.patent_id:
-                        result.grading_score = grade.score
-                        result.grading_reason = grade.reason
+                        # Priority Boost: If explicitly requested, force score to 1.0
+                        if result.is_prioritized:
+                            result.grading_score = 1.0
+                            result.grading_reason = f"[PRIORITIZED] {grade.reason}"
+                        else:
+                            result.grading_score = grade.score
+                            result.grading_reason = grade.reason
+            
+            # Failsafe: Ensure prioritized results are ALWAYS boosted, even if LLM omitted them
+            for result in results:
+                if result.is_prioritized:
+                    result.grading_score = 1.0
+                    if not result.grading_reason:
+                        result.grading_reason = "[PRIORITIZED] Explicitly requested by user"
+                    elif "[PRIORITIZED]" not in result.grading_reason:
+                         result.grading_reason = f"[PRIORITIZED] {result.grading_reason}"
             
             return grading_response
             
         except Exception as e:
             logger.error(f"Failed to parse grading response: {e}")
+            # Even on error, return prioritized results
+            for result in results:
+                if result.is_prioritized:
+                    result.grading_score = 1.0
+                    result.grading_reason = "[PRIORITIZED] Grading failed but ID matched"
             return GradingResponse(results=[], average_score=0.0)
     
     async def rewrite_query(
@@ -552,8 +642,8 @@ JSON 형식으로 응답:
         use_hybrid: bool = True,
     ) -> List[PatentSearchResult]:
         """Complete search pipeline with grading and optional rewrite."""
-        # Initial HyDE search
-        hypothetical_claim, results = await self.hyde_search(user_idea, use_hybrid=use_hybrid)
+        # Initial Search (Multi-Query handles ID prioritization)
+        queries, results = await self.search_multi_query(user_idea, use_hybrid=use_hybrid)
         
         if not results:
             logger.warning("No search results found")
@@ -570,7 +660,7 @@ JSON 형식으로 응답:
             rewrite = await self.rewrite_query(user_idea, results)
             logger.info(f"Rewritten query: {rewrite.optimized_query}")
             
-            _, new_results = await self.hyde_search(rewrite.optimized_query, use_hybrid=use_hybrid)
+            _, new_results = await self.search_multi_query(rewrite.optimized_query, use_hybrid=use_hybrid)
             
             new_grading = await self.grade_results(user_idea, new_results)
             logger.info(f"After rewrite - Average score: {new_grading.average_score:.2f}")
@@ -598,15 +688,25 @@ JSON 형식으로 응답:
         if not results:
             return self._empty_analysis()
         
-        patents_text = "\n\n".join([
-            f"=== 특허 {r.publication_number} ===\n"
-            f"제목: {r.title}\n"
-            f"IPC: {', '.join(r.ipc_codes[:3])}\n"
-            f"초록: {r.abstract}\n"
-            f"청구항: {r.claims}\n"
-            f"관련성 점수: {r.grading_score:.2f} ({r.grading_reason})"
-            for r in results[:5]
-        ])
+        # Filter out low-quality results to prevent hallucinations
+        # We only analyze patents that have a minimum baseline relevance.
+        relevant_results = [r for r in results if r.grading_score >= 0.3][:5]
+        
+        if not relevant_results:
+            # If no results are good enough, we still want to inform the user
+            # rather than failing silently or hallucinating.
+            patents_text = "제공된 검색 결과 중 분석할 가치가 있는(점수 0.3 이상) 관련 특허가 없습니다."
+        else:
+            patents_text = "\n\n".join([
+                f"=== 특허 {r.publication_number} ===\n"
+                f"제목: {r.title}\n"
+                f"IPC: {', '.join(r.ipc_codes[:3])}\n"
+                f"초록: {r.abstract}\n"
+                f"청구항: {r.claims}\n"
+                f"관련성 점수: {r.grading_score:.2f} ({r.grading_reason})"
+                for r in relevant_results
+            ])
+
         
         system_prompt, user_prompt = self._build_analysis_prompts(user_idea, patents_text)
         
@@ -667,31 +767,51 @@ JSON 형식으로 응답:
             yield "분석할 특허가 없습니다."
             return
         
-        patents_text = "\n\n".join([
-            f"=== 특허 {r.publication_number} ===\n"
-            f"제목: {r.title}\n"
-            f"IPC: {', '.join(r.ipc_codes[:3])}\n"
-            f"초록: {r.abstract[:500]}\n"
-            f"청구항: {r.claims[:500]}\n"
-            f"관련성 점수: {r.grading_score:.2f}"
-            for r in results[:5]
-        ])
+        # Filter out low-quality results to prevent hallucinations
+        relevant_results = [r for r in results if r.grading_score >= 0.3][:5]
         
-        system_prompt = """당신은 특허 분쟁 대응 전문 변리사입니다. 당신의 목표는 제공된 선행 특허(Context)와 사용자의 아이디어를 '매우 비판적이고 보수적인' 관점에서 대비 분석하는 것입니다.
+        if not relevant_results:
+            patents_text = "제공된 검색 결과 중 분석할 가치가 있는(점수 0.3 이상) 관련 특허가 없습니다."
+        else:
+            patents_text = "\n\n".join([
+                f"=== 특허 {r.publication_number} ===\n"
+                f"제목: {r.title}\n"
+                f"IPC: {', '.join(r.ipc_codes[:3])}\n"
+                f"초록: {r.abstract[:500]}\n"
+                f"청구항: {r.claims[:500]}\n"
+                f"관련성 점수: {r.grading_score:.2f}"
+                for r in relevant_results
+            ])
 
-분석 원칙:
-1. 엄격한 사실 기반 분석(Faithfulness): 반드시 제공된 선행 기술의 내용에만 기반하십시오. "Context에 없는 내용"을 근거로 사용자의 아이디어가 독창적이라고 판단하지 마십시오. 만약 선행 기술과 유사한 점이 있다면 아주 작은 부분이라도 놓치지 말고 지적하십시오.
-2. 청구항 단위 정밀 분석(Claim-Level): 각 특허의 실제 청구항 문언을 바탕으로 대비 분석을 수행하십시오.
-3. 구성요소 대비 분석: 사용자의 기술이 선행 특허 청구항의 구성요소를 하나라도 포함한다면, 해당 특허와의 유사성을 강력하게 언급하십시오.
-4. 침해 리스크 판정: 조금이라도 겹치는 부분이 있다면 'Medium' 이상으로 판정하며, 기술적 원리가 동일하면 'High'로 판정하십시오. 사용자의 아이디어가 완전히 새롭다는 결론을 내리기 전에, 선행 기술의 포괄적인 범위를 먼저 고려하십시오.
-5. 구체적 증거 제시: 모든 분석 결과에는 반드시 해당 내용을 담고 있는 [특허번호]를 명시하십시오.
+        
+        system_prompt = """당신은 20년 경력의 특허 분쟁 대응 전문 변리사입니다. 당신의 목표는 제공된 선행 특허(Context)와 사용자의 아이디어를 '매우 비판적이고 보수적인' 관점에서 대비하여 침해 리스크와 기술적 유사도를 정밀하게 분석하는 것입니다.
+
+분석 원칙 (CRITICAL):
+1. **사실에만 기반 (Strict Faithfulness)**: 
+   - 오직 아래 [Context]에 제공된 텍스트만 사용하십시오.
+   - **절대 Context에 없는 정보를 만들어내지 마십시오 (NEVER FABRICATE).**
+   - [특허번호]를 보고 당신의 학습 데이터에서 정보를 가져오는 것은 금지입니다.
+   - Context에 명시되지 않은 기술적 세부사항을 추측하지 마십시오.
+
+2. **명시적 인용 의무 (Explicit Citation)**:
+   - 모든 분석 주장에는 반드시 [특허번호]를 병기하십시오.
+   - 인용할 특허가 없으면 해당 주장을 하지 마십시오.
+
+3. **불확실성 인정 (Acknowledge Uncertainty)**:
+   - Context에 정보가 부족하면 "정보 부족" 또는 "N/A"로 표기하십시오.
+
+4. **엄격한 구성요소 대비 (All Elements Rule)**: 
+   - 청구항의 각 구성요소를 1:1로 대비하여, 문언적 일치 여부를 엄격하게 판단하십시오.
+
+
+
 
 **중요**: 마크다운 형식으로 실시간 출력하십시오.
 
 분석 절차:
 1. **청구항 특정**: 각 특허에서 가장 침해 위험이 높은 '대표 청구항'을 하나씩 특정하십시오.
 2. **구성요소 대비 (All Elements Rule)**: 
-   - 사용자의 아이디어(A)가 선행 특허 청구항(B)의 모든 구성요소를 포함하는지(A ⊇ B) 검토하십시오.
+   - 사용자의 아이디어가 선행 특허 청구항의 모든 구성요소를 포함하는지 검토하십시오.
    - 하나라도 포함하지 않으면 비침해(회피 가능)로 판단하십시오.
 3. **침해 리스크 판정**: 
    - High: 아이디어에 청구항의 모든 구성요소가 포함됨 (문언 침해 위험)
@@ -747,13 +867,29 @@ JSON 형식으로 응답:
     
     def _build_analysis_prompts(self, user_idea: str, patents_text: str) -> Tuple[str, str]:
         """Build system and user prompts for analysis."""
-        system_prompt = """당신은 특허 분쟁 대응 전문 변리사입니다. 당신의 목표는 제공된 선행 특허(Context)와 사용자의 아이디어를 '매우 비판적이고 보수적인' 관점에서 대비 분석하는 것입니다.
+        system_prompt = """당신은 20년 경력의 특허 분쟁 대응 전문 변리사입니다. 
+당신의 목표는 제공된 선행 특허(Context)와 사용자의 아이디어를 대비하여, 신규성이나 진보성이 부정될 수 있는지 혹은 침해 리스크가 있는지를 '매우 비판적이고 보수적인' 관점에서 정밀 분석하는 것입니다.
 
-분석 원칙:
-1. 엄격한 사실 기반 분석(Faithfulness): 반드시 제공된 선행 기술의 내용에만 기반하십시오. "Context에 없는 내용"을 근거로 사용자의 아이디어가 독창적이라고 판단하지 마십시오. 만약 선행 기술과 유사한 점이 있다면 아주 작은 부분이라도 놓치지 말고 지적하십시오.
-2. 구성요소 대비 분석: 사용자의 기술이 선행 특허 청구항의 구성요소를 하나라도 포함한다면, 해당 특허와의 유사성을 강력하게 언급하십시오.
-3. 침해 리스크 판정: 조금이라도 겹치는 부분이 있다면 'Medium' 이상으로 판정하며, 기술적 원리가 동일하면 'High'로 판정하십시오. 사용자의 아이디어가 완전히 새롭다는 결론을 내리기 전에, 선행 기술의 포괄적인 범위를 먼저 고려하십시오.
-4. 구체적 증거 제시: 모든 분석 결과에는 반드시 해당 내용을 담고 있는 [특허번호]를 명시하십시오."""
+분석 원칙 (CRITICAL):
+1. **사실에만 기반 (Strict Faithfulness)**: 
+   - 오직 아래 [Context]에 제공된 텍스트만 사용하십시오.
+   - **절대 Context에 없는 정보를 만들어내지 마십시오 (NEVER FABRICATE).**
+   - 특허 번호를 보고 당신의 학습 데이터에서 정보를 가져오는 것은 금지입니다.
+   - Context에 명시되지 않은 기술적 세부사항을 추측하지 마십시오.
+
+2. **명시적 인용 의무 (Explicit Citation)**:
+   - 모든 분석 주장에는 반드시 [특허번호]를 병기하십시오.
+   - 예: "벡터 검색 기술이 유사합니다 [CN-12345]"
+   - 인용할 특허가 없으면 해당 주장을 하지 마십시오.
+
+3. **불확실성 인정 (Acknowledge Uncertainty)**:
+   - Context에 정보가 부족하면 "Context에 명시되지 않음" 또는 "정보 부족"으로 표기하십시오.
+   - 추측하기보다 N/A로 표기하는 것이 더 정확한 분석입니다.
+
+4. **엄격한 구성요소 대비 (All Elements Rule)**: 
+   - 청구항의 각 구성요소를 1:1로 대비하여, 문언적 일치 여부를 엄격하게 판단하십시오.
+"""
+
 
         user_prompt = f"""[분석 대상: 사용자 아이디어]
 {user_idea}
